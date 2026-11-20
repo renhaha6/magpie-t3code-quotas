@@ -16,7 +16,9 @@ import {
   handleManagementApiCall,
   selectExposedAccounts,
 } from "../lib/adapter.mjs";
-import { createConfigStore, defaultConfig, resolveMagpieBaseUrl } from "../lib/config.mjs";
+import { createConfigStore, defaultConfig, normalizeConfig, resolveMagpieBaseUrl } from "../lib/config.mjs";
+import { countChipEmail, normalizeLang, resolveLang } from "../lib/i18n.mjs";
+import { renderUiHtml } from "../lib/ui.mjs";
 import { clusterResetWaves, poolQuotasByPlan, summarizeProviderQuotas } from "../lib/pool.mjs";
 import { isAllowedHostHeader, startServer } from "../lib/server.mjs";
 import {
@@ -273,7 +275,8 @@ describe("3-level plan/account filtering & pooled reset strategies", () => {
 
     const pooledNone = poolQuotasByPlan(claudeMax, NOW_MS, { resetStrategy: "none" });
     assert.equal(pooledNone.length, 1);
-    assert.equal(pooledNone[0].displayLabel, "全部 2 个账号 · max");
+    assert.equal(pooledNone[0].displayLabel, "2 accounts · max");
+    assert.equal(pooledNone[0].quota.user, "2 accounts · max");
     const wNone = pooledNone[0].quota.windows.find((w) => w.name === "5 hours");
     assert.equal(wNone.used, 66); // alice 32 + bob held 100 -> 66
     assert.equal(wNone.resetsAt, undefined, "none strategy must omit misleading single resetsAt");
@@ -292,6 +295,13 @@ describe("3-level plan/account filtering & pooled reset strategies", () => {
       pooledLatest[0].quota.windows.find((w) => w.name === "5 hours").resetsAt,
       "2026-11-21T03:00:00.000Z",
     );
+
+    const pooledAverage = poolQuotasByPlan(claudeMax, NOW_MS, { resetStrategy: "average", lang: "zh-CN" });
+    assert.equal(
+      pooledAverage[0].quota.windows.find((w) => w.name === "5 hours").resetsAt,
+      "2026-11-21T02:30:00.000Z",
+    );
+    assert.equal(pooledAverage[0].displayLabel, "2 个账号 · max（平均）");
 
     // Stale asOf still excluded in summary
     const summary = summarizeProviderQuotas(
@@ -718,5 +728,61 @@ describe("T3 Code settings wiring, SECRET_REDACTED handling, and live port switc
       await app.close();
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("i18n, count chip and reset pick", () => {
+  // Mirrors T3 Code's accountInitials() in UsageLimitsPooled.tsx.
+  const initials = (email) => {
+    const [local = "", domain = ""] = email.split("@");
+    return `${local[0] ?? ""}${domain[0] ?? ""}`.toUpperCase() || "?";
+  };
+
+  test("merged rows show their account count in T3 Code's chip", () => {
+    assert.equal(initials(countChipEmail(5, "5 accounts · Max")), "5");
+    assert.equal(initials(countChipEmail(12, "12 accounts · Max")), "12");
+    assert.equal(initials(countChipEmail(12, "12 个账号 · Max")), "12");
+    assert.equal(initials(countChipEmail(37, "37 個帳號")), "37");
+    assert.equal(initials(countChipEmail(150, "150 accounts")), "99");
+
+    const many = Array.from({ length: 12 }, (_, i) => ({
+      provider: "claude", plan: "max", user: `u${i}@example.com`,
+      windows: [{ name: "5 hours", used: 10, resetsAt: "2026-11-21T03:00:00Z" }],
+    }));
+    const { t3Accounts } = classifyMagpieQuotas(many, { lang: "zh-TW" });
+    const exposed = selectExposedAccounts(t3Accounts, { ...defaultConfig(), mode: "auto" }, NOW_MS, { lang: "zh-TW" });
+    assert.equal(exposed.length, 1);
+    assert.equal(exposed[0].displayLabel, "12 個帳號 · max");
+    const files = buildAuthFilesResponse(exposed).files;
+    assert.equal(initials(files[0].email), "12");
+  });
+
+  test("language resolution and reset pick normalization", () => {
+    assert.equal(normalizeLang("zh"), "zh-CN");
+    assert.equal(normalizeLang("zh-Hant-TW"), "zh-TW");
+    assert.equal(normalizeLang("zh_HK.UTF-8"), "zh-TW");
+    assert.equal(normalizeLang("ja"), "en");
+    assert.equal(resolveLang({ language: "zh-TW", magpieLang: "en" }, {}), "zh-TW");
+    assert.equal(resolveLang({ language: "auto", magpieLang: "zh" }, {}), "zh-CN");
+    assert.equal(resolveLang({ language: "auto" }, { LANG: "en_US.UTF-8" }), "en");
+
+    const base = defaultConfig();
+    assert.equal(base.pooledResetStrategy, "when-aligned");
+    assert.equal(base.pooledResetPick, "latest");
+    assert.equal(base.language, "auto");
+    const on = normalizeConfig({ pooledResetStrategy: "average" }, base);
+    assert.equal(on.pooledResetPick, "average");
+    const off = normalizeConfig({ pooledResetStrategy: "when-aligned" }, on);
+    assert.equal(off.pooledResetPick, "average", "switching off remembers the pick");
+    assert.equal(normalizeConfig({ language: "xx", magpieLang: "zh-TW" }, base).language, "auto");
+    assert.equal(normalizeConfig({ magpieLang: "zh-Hant" }, base).magpieLang, "zh-TW");
+  });
+
+  test("control page script parses and ships all three languages", () => {
+    const html = renderUiHtml({ uiToken: "tok</script>" });
+    const script = html.match(/<script>([\s\S]*)<\/script>/)[1];
+    assert.doesNotThrow(() => new Function(script));
+    assert.ok(!script.includes("tok</script>"));
+    for (const word of ["显示方式", "顯示方式", "Display"]) assert.ok(html.includes(word));
   });
 });

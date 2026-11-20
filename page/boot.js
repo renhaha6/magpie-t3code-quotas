@@ -11,12 +11,14 @@
   let theme = "";
   let tokens = null;
   let service = "";
+  let lang = "";
 
   try {
     const t = await window.magpie?.ready;
     if (t) {
       if (typeof t.dark === "boolean") theme = t.dark ? "dark" : "light";
       if (t.tokens && typeof t.tokens === "object") tokens = t.tokens;
+      if (typeof t.lang === "string") lang = t.lang;
     }
   } catch { /* fallback to default theme */ }
 
@@ -35,8 +37,15 @@
     }
   } catch { /* default port */ }
 
+  const say = words(lang || document.documentElement.lang || navigator.language);
+  const said0 = document.getElementById("said");
+  if (said0) said0.textContent = say.connecting;
+  const title0 = document.getElementById("bootTitle");
+  if (title0) title0.textContent = say.title;
+
   const q = new URLSearchParams();
   if (theme) q.set("theme", theme);
+  if (lang) q.set("lang", lang);
   const slim = {};
   for (const [k, v] of Object.entries(tokens || {})) {
     const s = String(v ?? "").trim();
@@ -57,8 +66,7 @@
       box.id = "boot-fallback";
 
       const msg = document.createElement("p");
-      msg.textContent =
-        "无法连接本地服务（127.0.0.1:" + p + "），可能是插件未启用，或该端口已被其他程序占用。";
+      msg.textContent = say.unreachable.replace("{p}", String(p));
       box.appendChild(msg);
 
       const controls = document.createElement("div");
@@ -66,7 +74,7 @@
 
       const retryBtn = document.createElement("button");
       retryBtn.type = "button";
-      retryBtn.textContent = "重试";
+      retryBtn.textContent = say.retry;
       retryBtn.onclick = () => location.reload();
       controls.appendChild(retryBtn);
 
@@ -80,23 +88,23 @@
 
         const switchBtn = document.createElement("button");
         switchBtn.type = "button";
-        switchBtn.textContent = "更换端口并重试";
+        switchBtn.textContent = say.switchPort;
         let busy = false;
         switchBtn.onclick = async () => {
           if (busy) return;
           const nextPort = Number(input.value);
           if (!Number.isInteger(nextPort) || nextPort < 1 || nextPort > 65535) {
-            msg.textContent = "请输入 1 到 65535 之间的有效端口号。";
+            msg.textContent = say.badPort;
             return;
           }
           busy = true;
           switchBtn.disabled = true;
-          msg.textContent = "正在将端口更新为 " + nextPort + " 并重启服务…";
+          msg.textContent = say.switching.replace("{p}", String(nextPort));
           try {
             await window.magpie.options.set({ ...savedOptions, port: nextPort });
             setTimeout(() => location.reload(), 1200);
           } catch (err) {
-            msg.textContent = "更新端口失败：" + String(err?.message || err);
+            msg.textContent = say.switchFail + String(err?.message || err);
             busy = false;
             switchBtn.disabled = false;
           }
@@ -118,19 +126,52 @@
 
   const target = "http://127.0.0.1:" + port + "/" + (query ? "?" + query : "");
   if (!isLoopback(location.hostname)) {
-    showRemote(port, target);
+    showRemote(port, target, say);
     return;
   }
   armTimeout(port);
   location.replace(target);
 })();
 
+function words(raw) {
+  const s = String(raw || "").toLowerCase();
+  const tw = s.startsWith("zh") && /(?:-tw|-hk|-mo|-hant)/.test(s);
+  if (s.startsWith("zh") && !tw) {
+    return {
+      title: "T3 Code 额度", connecting: "正在连接本地服务…",
+      unreachable: "连不上本地服务（127.0.0.1:{p}）：插件可能没开，或端口被占用。",
+      retry: "重试", switchPort: "换端口重试", badPort: "端口需为 1–65535。",
+      switching: "正在切换到端口 {p}…", switchFail: "切换失败：",
+      remote1: "服务在 Magpie 所在机器的 127.0.0.1:{p}，当前浏览器无法直连。",
+      remote2: "建立 SSH 端口转发后点「继续」：", go: "继续",
+    };
+  }
+  if (tw) {
+    return {
+      title: "T3 Code 額度", connecting: "正在連線本機服務…",
+      unreachable: "連不上本機服務（127.0.0.1:{p}）：外掛可能沒開，或連接埠被占用。",
+      retry: "重試", switchPort: "換連接埠重試", badPort: "連接埠需為 1–65535。",
+      switching: "正在切換到連接埠 {p}…", switchFail: "切換失敗：",
+      remote1: "服務在 Magpie 所在機器的 127.0.0.1:{p}，目前瀏覽器無法直連。",
+      remote2: "建立 SSH 連接埠轉發後按「繼續」：", go: "繼續",
+    };
+  }
+  return {
+    title: "T3 Code Quotas", connecting: "Connecting to the local service…",
+    unreachable: "Can't reach the local service (127.0.0.1:{p}): the plugin may be off or the port is busy.",
+    retry: "Retry", switchPort: "Switch port and retry", badPort: "Port must be 1–65535.",
+    switching: "Switching to port {p}…", switchFail: "Switch failed: ",
+    remote1: "The service runs on 127.0.0.1:{p} of the Magpie machine; this browser can't reach it directly.",
+    remote2: "Set up an SSH port forward, then press Continue:", go: "Continue",
+  };
+}
+
 function isLoopback(host) {
   const h = String(host || "").toLowerCase().replace(/^\[|\]$/g, "");
   return h === "" || h === "localhost" || h.endsWith(".localhost") || h === "::1" || /^127\./.test(h);
 }
 
-function showRemote(port, target) {
+function showRemote(port, target, say) {
   const said = document.getElementById("said");
   if (!said) return;
   const host = location.hostname.replace(/^\[|\]$/g, "");
@@ -141,14 +182,14 @@ function showRemote(port, target) {
     said.appendChild(el);
     return el;
   };
-  p("服务运行在 Magpie 所在机器的 127.0.0.1:" + port + "，当前浏览器无法直连。");
-  p("请建立 SSH 端口转发后点击「继续」：");
+  p(say.remote1.replace("{p}", String(port)));
+  p(say.remote2);
   const code = p("ssh -N -L " + port + ":127.0.0.1:" + port + " <user>@" + host);
   code.style.fontFamily = "ui-monospace, Menlo, Consolas, monospace";
   code.style.userSelect = "all";
   const go = document.createElement("button");
   go.type = "button";
-  go.textContent = "继续";
+  go.textContent = say.go;
   go.addEventListener("click", () => location.replace(target));
   said.appendChild(go);
 }
