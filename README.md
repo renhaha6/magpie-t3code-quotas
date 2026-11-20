@@ -1,34 +1,29 @@
 # magpie-t3code-quotas
 
-极简的 **Magpie 插件（协议适配器）**，把 Magpie 的多账号订阅额度通过 T3 Code 原生的 **Usage Hub（CLIProxyAPI 协议）** 共享给 T3 Code 查阅。
+极简的 **Magpie 插件**，让你在 **T3 Code 的 `Usage → Limits`** 里直接查看 Magpie 各账号的剩余额度与多账号汇总。
 
-- **零改源码**：不改 Magpie 本体，也不改 T3 Code 本体，只做薄适配层。
-- **零第三方依赖**：纯 ES Modules + Node/Bun 内置 API，直接可在 Magpie 插件宿主里运行。
-- **零凭证接触**：只读取 Magpie 本机公开的 `GET /v1/magpie/quotas`（默认 `?kept=1` 读缓存防 429），不碰任何 OAuth Token，不额外请求上游厂商。
-- **吃满原生能力**：
-  - 上游复用 Magpie 原生的多账号采集、Remote Magpie 聚合和缓存刷新。
-  - 下游复用 T3 Code 原生的 **Usage → Limits** 多账号按套餐权重汇总（Pooled Limits）、`/usage-limits` 命令和手机端 Widget。
+- **零改源码**：不改 Magpie 本体，也不改 T3 Code 本体，纯薄适配层。
+- **零第三方依赖**：纯 ES Modules + Node/Bun 内置 API。
+- **装完自动接入**：自动写入 `~/.t3/userdata/settings.json`（兼容 `$T3CODE_HOME`），T3 Code 自动热加载，无需手动填表；并正确识别 T3 Code 对密钥的加密脱敏（`••••••`），重启不再反复要求重新同步。
+- **安全隔离**：首次启动自动生成高熵随机连接密钥；仅监听 `127.0.0.1`、严格校验 `Host` 头防 DNS rebinding，控制页接口校验每次启动生成的随机 `X-UI-Token`，绝不触碰任何 OAuth Token。
 
 ---
 
 ## 安装方式
 
-### 方式一：直接在 Magpie 里安装（推荐）
+### 在 Magpie 中安装（推荐）
 
-在 Magpie 的 **Plugins（插件）** 页点击添加，或在终端执行：
+打开 Magpie → **Plugins（插件）** 添加，或执行：
 
 ```sh
 magpie plugin add github:uiuing/magpie-t3code-quotas
 ```
 
-（如果是本地调试，也可以直接装本地目录：`magpie plugin add /你的路径/magpie-t3code-quotas`）
+安装开启后：
+- 插件自动随 Magpie 启动并写入 T3 Code 配置，直接去 T3 Code 按 `⌘U`（`Usage → Limits`）或输入 `/usage-limits` 即可查看额度。
+- Magpie 左侧栏会出现 **「T3 Code 额度」** 控制页，所有勾选与设置修改即生效。
 
-安装并开启后：
-- 插件会随 Magpie 自动在本机启动一个只读 HTTP 适配服务（默认 `http://127.0.0.1:3478`）。
-- **自动接入 T3 Code（无需手动填表）**：与 Magpie 原生接入 T3 Code 的方式一致，插件会自动往 `~/.t3/userdata/settings.json`（或 `$T3CODE_HOME/userdata/settings.json`）写入 `usageLimitSources["magpie-quotas"]`，保留你原有的全部配置与其他 Hub；T3 Code 监听到文件更新后会自动热加载。
-- Magpie 左侧栏会出现 **「T3 Code 额度」** 页面，可以查看实时状态、切换同步模式、按账号勾选，或一键「从 T3 Code 移除」。
-
-### 方式二：独立命令行运行（无需装进 Magpie）
+### 独立命令行运行（可选）
 
 ```sh
 bun serve.mjs
@@ -36,49 +31,30 @@ bun serve.mjs
 node serve.mjs
 ```
 
-支持环境变量覆盖：`PORT`、`MANAGEMENT_KEY`、`MAGPIE_ADDR` / `MAGPIE_URL`、`MAGPIE_API_KEY`、`KEPT_ONLY`。
+支持环境变量：`PORT`、`MANAGEMENT_KEY`、`MAGPIE_ADDR` / `MAGPIE_URL`、`MAGPIE_API_KEY`、`KEPT_ONLY`。
 
 ---
 
-## 在 T3 Code 中查看额度
+## 核心功能
 
-本机装完插件后**无需在 T3 Code 里手动添加 Hub**：直接按 `Cmd+U` / `Ctrl+U` 打开 **Usage → Limits**，或在对话输入框输入 `/usage-limits`，即可看到 Magpie 中的多账号额度与按套餐汇总进度条。
-
-> 如果你的 T3 Code 跑在另一台机器，或你在配置页关闭了「自动写入 T3 Code 配置」，也可以在 T3 Code 的 **Settings → Providers → Usage providers → Add hub** 里手动填入 Magpie「T3 Code 额度」页提供的 URL 和 Management Key。
-
----
-
-## 同步模式与筛选说明
-
-在 Magpie 侧边栏的 **「T3 Code 额度」** 页面中修改后**立即生效**，无需重启 Magpie：
-
-- **逐账号明细（`per-account`，默认推荐）**：把选中的每个账号明细直接传给 T3 Code，由 T3 Code 原生按套餐权重做 Pooled 汇总并保留单账号分段条与重置倒计时。
-- **按同套餐预汇总（`pooled`）**：按 Magpie 同套餐合并规则（同套餐求均值、自动剔除过期缓存、被周限卡死的 5h 窗按 100% 已用计）合并成合集额度后再传给 T3 Code。
-- **仅活跃账号（`active-only`）**：每个厂商仅同步 Magpie 标记为最近活跃（`last`）的账号。
-- **账号筛选**：支持「默认全量同步并排除取消勾选的账号」或「仅同步明确勾选的账号」。
-
-### 插件选项（Magpie `plugins.json`）
-
-可以在 Magpie 的 Plugins 页选项里设置初始参数（端口修改在此处生效）：
-
-```json
-{
-  "port": 3478,
-  "managementKey": "magpie-t3code-local",
-  "keptOnly": true,
-  "mode": "per-account"
-}
-```
+1. **按「厂商 → 套餐 → 账号」三级勾选**
+   - 可以一键勾选或取消整个套餐（例如只同步 Claude Max 与 Codex Pro），也可展开微调单个账号。
+   - 支持「新加入的账号自动同步」开关，记忆套餐级偏好。
+2. **多账号重置时间不误导**
+   - **默认推荐「每个账号单独显示」**：把选中套餐的账号逐个交给 T3 Code，由 T3 Code 原生拼成分段汇总条，精确显示「下次重置具体回血哪一段、回多少百分比」。
+   - **「同套餐合并成 1 条」模式**：提供重置时间口径选择——默认**不显示单一重置时间（防误导）**，也可切换为「最早单号回血时间」或「全部重置时间（最晚）」。
+   - 在插件页面里的每个套餐行，同时标出「最早单号回血」与「全部恢复」时间。
+3. **页面内直接热切换端口**
+   - 在设置页直接输入新端口并点击「切换端口」：先试绑定新端口（被占用时报错不中断原服务），绑定成功后自动更新 `plugins.json` 与 T3 Code 配置并跳转。
+   - 若启动时端口被占用，超时兜底页也支持直接换端口重试。
 
 ---
 
-## 支持范围与已知边界
+## 支持范围与说明
 
-- **T3 Code 原生 `Usage → Limits` 显示范围**：受 T3 Code 服务端 `HUB_PROVIDERS` 白名单限制，原生 Hub 目前仅识别 **Claude、Codex (ChatGPT)、Antigravity、Grok (xAI)** 这 4 类订阅账号（包含多账号、多套餐与 Remote Magpie 账号）。
-- **其他厂商额度**：WorkBuddy、DeepSeek、Kimi、GLM、MiniMax 及 API Key 余额不会被塞进 T3 Code 原生白名单，但仍会在本插件的控制页里按 Magpie 规则汇总展示。
-- **只读安全**：仅提供只读查询；Codex 重置卡兑换等写操作请在 Magpie 内进行。
-
----
+- **T3 Code 原生 `Usage → Limits` 范围**：受 T3 Code 服务端白名单限制，原生显示 **Claude、Codex (ChatGPT)、Antigravity、Grok** 四类订阅账号（支持多账号、多套餐与 Remote Magpie 账号）。
+- **其他厂商额度**：WorkBuddy、DeepSeek、Kimi、GLM、MiniMax 及 API Key 余额会在插件控制页第 4 节按 Magpie 规则汇总展示。
+- **远程 T3 Code 接入**：服务仅监听 `127.0.0.1`；若 T3 Code 在另一台电脑，请在控制页展开「远程设备手动接入」复制 SSH 隧道命令后手动添加到 T3 Code。
 
 ## 本地测试
 

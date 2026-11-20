@@ -17,13 +17,17 @@ function ensureStarted(input, options) {
         } else {
           info.ready.then(
             (p) => p && console.log(`[magpie-t3code-quotas] listening on http://127.0.0.1:${p}`),
-            (err) => console.error("[magpie-t3code-quotas] failed to bind:", err?.message || err),
+            (err) => {
+              console.error("[magpie-t3code-quotas] failed to bind:", err?.message || err);
+              started = null;
+            },
           );
         }
         return info;
       })
       .catch((err) => {
         console.error("[magpie-t3code-quotas] failed to start:", err?.message || err);
+        started = null;
         return null;
       });
   }

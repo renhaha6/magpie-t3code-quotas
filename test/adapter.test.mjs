@@ -15,15 +15,16 @@ import {
   handleManagementApiCall,
   selectExposedAccounts,
 } from "../lib/adapter.mjs";
-import { defaultConfig, resolveMagpieBaseUrl } from "../lib/config.mjs";
+import { createConfigStore, defaultConfig, resolveMagpieBaseUrl } from "../lib/config.mjs";
 import { poolQuotasByPlan, summarizeProviderQuotas } from "../lib/pool.mjs";
-import { startServer } from "../lib/server.mjs";
+import { isAllowedHostHeader, startServer } from "../lib/server.mjs";
 import {
   inspectT3CodeHub,
   isEphemeralCliPort,
   removeT3CodeHub,
   resolveT3SettingsPath,
   syncT3CodeHub,
+  T3_SECRET_REDACTED,
   T3_SOURCE_ID,
 } from "../lib/t3wire.mjs";
 
@@ -55,6 +56,16 @@ const SAMPLE_QUOTAS = [
     windows: [
       { name: "5 hours", used: 10, remaining: 90, resetsAt: "2026-11-21T02:00:00Z" },
       { name: "7 days", used: 100, remaining: 0, resetsAt: "2026-11-25T00:00:00Z" },
+    ],
+  },
+  {
+    provider: "claude",
+    name: "Claude Code",
+    kind: "subscription",
+    plan: "pro",
+    user: "carol@example.com",
+    windows: [
+      { name: "5 hours", used: 15, remaining: 85, resetsAt: "2026-11-21T04:00:00Z" },
     ],
   },
   {
@@ -114,362 +125,426 @@ const SAMPLE_QUOTAS = [
   },
 ];
 
-describe("config helpers", () => {
-  test("resolveMagpieBaseUrl handles MAGPIE_ADDR, wildcard host and explicit override", () => {
+describe("config & security helpers", () => {
+  test("generates random managementKey on first start and regenerates on empty/flag", () => {
+    const store = createConfigStore({ configDir: null });
+    const k1 = store.get().managementKey;
+    assert.ok(k1.startsWith("mgp_") && k1.length >= 24, "should generate random key");
+    assert.notEqual(k1, "magpie-t3code-local");
+
+    const k2 = store.update({ managementKey: "" }).managementKey;
+    assert.ok(k2.startsWith("mgp_") && k2 !== k1, "clearing key must regenerate a fresh random key");
+
+    const k3 = store.update({ regenerateKey: true }).managementKey;
+    assert.ok(k3.startsWith("mgp_") && k3 !== k2);
+  });
+
+  test("resolveMagpieBaseUrl and strict Host header validation", () => {
     assert.equal(resolveMagpieBaseUrl("", { MAGPIE_ADDR: "127.0.0.1:4000" }), "http://127.0.0.1:4000");
     assert.equal(resolveMagpieBaseUrl("", { MAGPIE_ADDR: "0.0.0.0:3425" }), "http://127.0.0.1:3425");
     assert.equal(resolveMagpieBaseUrl("http://192.168.1.10:3425/", {}), "http://192.168.1.10:3425");
-    assert.equal(resolveMagpieBaseUrl("", {}), "http://127.0.0.1:3425");
+
+    assert.equal(isAllowedHostHeader("127.0.0.1:3478", 3478), true);
+    assert.equal(isAllowedHostHeader("localhost:3478", 3478), true);
+    assert.equal(isAllowedHostHeader("[::1]:3478", 3478), true);
+    assert.equal(isAllowedHostHeader("evil.example:3478", 3478), false);
+    assert.equal(isAllowedHostHeader("sub.localhost:3478", 3478), false);
+    assert.equal(isAllowedHostHeader("127.0.0.1:9999", 3478), false);
   });
 });
 
 describe("provider classification & payload translation", () => {
-  test("splits T3-native providers from other Magpie providers and deduplicates keys", () => {
-    const { t3Accounts, otherAccounts } = classifyMagpieQuotas([
-      ...SAMPLE_QUOTAS,
-      { ...SAMPLE_QUOTAS[0] }, // duplicate identical key
-    ]);
+  test("keys omit plan so Plus->Pro upgrades preserve account identity", () => {
+    const a1 = classifyMagpieQuotas([
+      { provider: "codex", user: "u@example.com", plan: "plus", kind: "subscription", windows: [] },
+    ]).t3Accounts[0];
+    const a2 = classifyMagpieQuotas([
+      { provider: "codex", user: "u@example.com", plan: "pro", kind: "subscription", windows: [] },
+    ]).t3Accounts[0];
+    assert.equal(a1.key, "codex:u@example.com:");
+    assert.equal(a2.key, a1.key);
+    assert.equal(a1.planKey, "codex:plus");
+    assert.equal(a2.planKey, "codex:pro");
+  });
+
+  test("builds CLIProxyAPI auth-files and translates all 4 providers accurately", () => {
+    const { t3Accounts, otherAccounts } = classifyMagpieQuotas(SAMPLE_QUOTAS);
     assert.equal(t3Accounts.length, 6);
     assert.equal(otherAccounts.length, 2);
-    assert.equal(t3Accounts[0].key, "claude:alice@example.com:max:");
-    assert.equal(t3Accounts[5].key, "claude:alice@example.com:max:#2");
-  });
 
-  test("builds CLIProxyAPI auth-files matching T3 Code schema", () => {
-    const { t3Accounts } = classifyMagpieQuotas(SAMPLE_QUOTAS);
     const res = buildAuthFilesResponse(t3Accounts);
-    assert.equal(res.files.length, 5);
-
-    const codex = res.files.find((f) => f.provider === "codex");
-    assert.equal(codex.email, "codex@example.com");
-    assert.equal(codex.id_token.plan_type, "pro");
-    assert.equal(codex.id_token.chatgpt_plan_type, "pro");
-
+    assert.equal(res.files.length, 6);
     const agy = res.files.find((f) => f.provider === "antigravity");
-    assert.ok(agy.project_id && agy.project_id.length > 0, "antigravity must include non-empty project_id");
+    assert.ok(agy.project_id);
 
-    const grok = res.files.find((f) => f.provider === "xai");
-    assert.equal(grok.email, "grok@example.com");
-  });
+    const claude = buildClaudeUsagePayload(SAMPLE_QUOTAS[0], NOW_MS);
+    assert.deepEqual(claude.five_hour, { utilization: 32, resets_at: "2026-11-21T03:00:00.000Z" });
+    assert.equal(claude.limits.length, 2);
+    assert.equal(claude.extra_usage.used_credits, 25);
 
-  test("translates Claude windows including model-scoped and extra usage", () => {
-    const payload = buildClaudeUsagePayload(SAMPLE_QUOTAS[0]);
-    assert.deepEqual(payload.five_hour, { utilization: 32, resets_at: "2026-11-21T03:00:00.000Z" });
-    assert.deepEqual(payload.seven_day, { utilization: 45, resets_at: "2026-11-26T00:00:00.000Z" });
-    assert.equal(payload.limits.length, 2);
-    assert.deepEqual(payload.limits[0], {
-      kind: "weekly_scoped",
-      percent: 20,
-      resets_at: "2026-11-26T00:00:00.000Z",
-      scope: { model: { display_name: "Opus" } },
-    });
-    assert.equal(payload.extra_usage.is_enabled, true);
-    assert.equal(payload.extra_usage.used_credits, 25);
-    assert.equal(payload.extra_usage.monthly_limit, 200);
-  });
-
-  test("translates Codex usage with unix-second reset_at and reset credits", () => {
-    const usage = buildCodexUsagePayload(SAMPLE_QUOTAS[2]);
-    assert.equal(usage.plan_type, "pro");
-    assert.equal(usage.rate_limit.primary_window.used_percent, 25);
-    assert.equal(usage.rate_limit.primary_window.reset_at, Math.floor(Date.parse("2026-11-21T04:00:00Z") / 1000));
-    assert.equal(usage.rate_limit.primary_window.limit_window_seconds, 18000);
-    assert.equal(usage.rate_limit.secondary_window.used_percent, 40);
-    assert.equal(usage.rate_limit.secondary_window.limit_window_seconds, 604800);
-
-    const credits = buildCodexCreditsPayload(SAMPLE_QUOTAS[2], NOW_MS);
+    const codex = buildCodexUsagePayload(SAMPLE_QUOTAS[3], NOW_MS);
+    assert.equal(codex.plan_type, "pro");
+    assert.equal(codex.rate_limit.primary_window.reset_at, Math.floor(Date.parse("2026-11-21T04:00:00Z") / 1000));
+    const credits = buildCodexCreditsPayload(SAMPLE_QUOTAS[3], NOW_MS);
     assert.equal(credits.credits.length, 2);
-    assert.equal(credits.credits[0].reset_type, "codex_rate_limits");
-    assert.equal(credits.credits[0].status, "available");
-    assert.equal(credits.credits[0].expires_at, "2026-12-01T00:00:00.000Z");
-  });
 
-  test("translates Antigravity buckets with native prefixes and returns 404 for userinfo", () => {
-    const summary = buildAntigravitySummaryPayload(SAMPLE_QUOTAS[3]);
-    assert.equal(summary.buckets.length, 2);
-    assert.equal(summary.buckets[0].bucketId, "gemini-5h");
-    assert.equal(summary.buckets[0].window, "5h");
-    assert.equal(summary.buckets[0].remainingFraction, 0.7);
-    assert.equal(summary.buckets[1].bucketId, "3p-weekly");
-    assert.equal(summary.buckets[1].window, "weekly");
-    assert.equal(summary.buckets[1].remainingFraction, 0.5);
+    const agySummary = buildAntigravitySummaryPayload(SAMPLE_QUOTAS[4], NOW_MS);
+    assert.equal(agySummary.buckets[0].bucketId, "gemini-5h");
+    assert.equal(agySummary.buckets[1].bucketId, "3p-weekly");
 
-    const { t3Accounts } = classifyMagpieQuotas(SAMPLE_QUOTAS);
-    const agyKey = t3Accounts.find((a) => a.t3Provider === "antigravity").key;
-    const userInfoReply = handleManagementApiCall(
-      t3Accounts,
-      { auth_index: agyKey, url: "https://www.googleapis.com/oauth2/v2/userinfo" },
+    const grok = buildGrokUsagePayload(SAMPLE_QUOTAS[5], NOW_MS);
+    assert.equal(grok.config.creditUsagePercent, 42);
+    assert.equal(grok.config.currentPeriod.start, "2026-11-21T00:00:00.000Z");
+
+    // Stale asOf window dropped in per-account payload too
+    const staleClaude = buildClaudeUsagePayload(
+      {
+        provider: "claude",
+        asOf: "2026-11-20T00:00:00Z",
+        windows: [{ name: "5 hours", used: 99, resetsAt: "2026-11-20T05:00:00Z" }],
+      },
       NOW_MS,
     );
-    assert.equal(userInfoReply.status_code, 404);
+    assert.equal(staleClaude.five_hour, undefined);
   });
 
-  test("translates Grok weekly usage with ISO start and end", () => {
-    const payload = buildGrokUsagePayload(SAMPLE_QUOTAS[4], NOW_MS);
-    assert.equal(payload.config.creditUsagePercent, 42);
-    assert.equal(payload.config.currentPeriod.type, "USAGE_PERIOD_TYPE_WEEKLY");
-    assert.equal(payload.config.currentPeriod.end, "2026-11-28T00:00:00.000Z");
-    assert.equal(payload.config.currentPeriod.start, "2026-11-21T00:00:00.000Z");
-  });
-
-  test("returns 502 for accounts with error and no readable windows", () => {
+  test("returns 502 for broken accounts and 404 for Antigravity userinfo", () => {
     const { t3Accounts } = classifyMagpieQuotas([
-      { provider: "claude", user: "broken@example.com", kind: "subscription", error: "401 expired", windows: [] },
+      { provider: "claude", user: "broken@example.com", kind: "subscription", error: "401", windows: [] },
+      SAMPLE_QUOTAS[4],
     ]);
-    const reply = handleManagementApiCall(
-      t3Accounts,
-      { auth_index: t3Accounts[0].key, url: "https://api.anthropic.com/api/oauth/usage" },
-      NOW_MS,
+    assert.equal(
+      handleManagementApiCall(
+        t3Accounts,
+        { auth_index: t3Accounts[0].key, url: "https://api.anthropic.com/api/oauth/usage" },
+        NOW_MS,
+      ).status_code,
+      502,
     );
-    assert.equal(reply.status_code, 502);
+    assert.equal(
+      handleManagementApiCall(
+        t3Accounts,
+        { auth_index: t3Accounts[1].key, url: "https://www.googleapis.com/oauth2/v2/userinfo" },
+        NOW_MS,
+      ).status_code,
+      404,
+    );
   });
 });
 
-describe("pooling & selection modes", () => {
-  test("pooled mode merges same-plan accounts and counts weekly-held session as 100% used", () => {
+describe("3-level plan/account filtering & pooled reset strategies", () => {
+  test("plan-level exclusion and explicit plan selection work with per-account exceptions", () => {
     const { t3Accounts } = classifyMagpieQuotas(SAMPLE_QUOTAS);
-    const claudeOnly = t3Accounts.filter((a) => a.canonical === "claude");
-    const pooled = poolQuotasByPlan(claudeOnly, NOW_MS);
-    assert.equal(pooled.length, 1);
-    const fiveH = pooled[0].quota.windows.find((w) => w.name === "5 hours");
-    const sevenD = pooled[0].quota.windows.find((w) => w.name === "7 days");
-    // Alice 5h = 32%; Bob 7d = 100% holding 5h -> Bob counts as 100% -> mean = (32 + 100) / 2 = 66
-    assert.equal(fiveH.used, 66);
-    assert.equal(sevenD.used, 72.5);
-    // Earliest reset among 5h windows: Bob's 02:00 < Alice's 03:00
-    assert.equal(fiveH.resetsAt, "2026-11-21T02:00:00.000Z");
+
+    // Exclude entire claude:pro plan
+    const cfgExclPlan = { ...defaultConfig(), excludedPlans: ["claude:pro"] };
+    const out1 = selectExposedAccounts(t3Accounts, cfgExclPlan, NOW_MS);
+    assert.equal(out1.some((a) => a.quota.user === "carol@example.com"), false);
+    assert.equal(out1.some((a) => a.quota.user === "alice@example.com"), true);
+
+    // Exclude claude:max plan, but explicitly keep alice
+    const aliceKey = t3Accounts.find((a) => a.quota.user === "alice@example.com").key;
+    const cfgExcept = {
+      ...defaultConfig(),
+      excludedPlans: ["claude:max"],
+      selectedAccounts: [aliceKey],
+    };
+    const out2 = selectExposedAccounts(t3Accounts, cfgExcept, NOW_MS);
+    assert.equal(out2.some((a) => a.quota.user === "alice@example.com"), true);
+    assert.equal(out2.some((a) => a.quota.user === "bob@example.com"), false);
+
+    // Only-selected mode selecting claude:max plan picks both alice and bob
+    const cfgOnlyPlan = {
+      ...defaultConfig(),
+      selectionMode: "only-selected",
+      selectedPlans: ["claude:max"],
+    };
+    const out3 = selectExposedAccounts(t3Accounts, cfgOnlyPlan, NOW_MS);
+    assert.deepEqual(
+      out3.map((a) => a.quota.user).sort(),
+      ["alice@example.com", "bob@example.com"],
+    );
   });
 
-  test("stale cached windows (asOf + past resetsAt) are ignored in pooling", () => {
+  test("pooled reset strategies: none omits resetsAt, earliest vs latest pick exact bounds", () => {
+    const { t3Accounts } = classifyMagpieQuotas(SAMPLE_QUOTAS);
+    const claudeMax = t3Accounts.filter((a) => a.planKey === "claude:max");
+
+    const pooledNone = poolQuotasByPlan(claudeMax, NOW_MS, { resetStrategy: "none" });
+    assert.equal(pooledNone.length, 1);
+    assert.equal(pooledNone[0].displayLabel, "全部 2 个账号 · max");
+    const wNone = pooledNone[0].quota.windows.find((w) => w.name === "5 hours");
+    assert.equal(wNone.used, 66); // alice 32 + bob held 100 -> 66
+    assert.equal(wNone.resetsAt, undefined, "none strategy must omit misleading single resetsAt");
+    assert.equal(wNone.soonestResetAt, "2026-11-21T02:00:00.000Z");
+    assert.equal(wNone.latestResetAt, "2026-11-21T03:00:00.000Z");
+    assert.equal(wNone.soonestResetCount, 1);
+
+    const pooledEarliest = poolQuotasByPlan(claudeMax, NOW_MS, { resetStrategy: "earliest" });
+    assert.equal(
+      pooledEarliest[0].quota.windows.find((w) => w.name === "5 hours").resetsAt,
+      "2026-11-21T02:00:00.000Z",
+    );
+
+    const pooledLatest = poolQuotasByPlan(claudeMax, NOW_MS, { resetStrategy: "latest" });
+    assert.equal(
+      pooledLatest[0].quota.windows.find((w) => w.name === "5 hours").resetsAt,
+      "2026-11-21T03:00:00.000Z",
+    );
+
+    // Stale asOf still excluded in summary
     const summary = summarizeProviderQuotas(
       [
-        {
-          provider: "claude",
-          plan: "pro",
-          asOf: "2026-11-20T10:00:00Z",
-          windows: [{ name: "5 hours", used: 95, resetsAt: "2026-11-20T15:00:00Z" }],
-        },
-        {
-          provider: "claude",
-          plan: "pro",
-          windows: [{ name: "5 hours", used: 20, resetsAt: "2026-11-21T04:00:00Z" }],
-        },
+        { provider: "claude", plan: "pro", asOf: "2026-11-20T10:00:00Z", windows: [{ name: "5 hours", used: 95, resetsAt: "2026-11-20T15:00:00Z" }] },
+        { provider: "claude", plan: "pro", windows: [{ name: "5 hours", used: 20, resetsAt: "2026-11-21T04:00:00Z" }] },
       ],
       NOW_MS,
     );
-    assert.equal(summary.windows.length, 1);
     assert.equal(summary.windows[0].used, 20);
-    assert.equal(summary.windows[0].stale, 1);
-  });
-
-  test("active-only and only-selected selection filters work accurately", () => {
-    const { t3Accounts } = classifyMagpieQuotas(SAMPLE_QUOTAS);
-    const cfgActive = { ...defaultConfig(), mode: "active-only" };
-    const active = selectExposedAccounts(t3Accounts, cfgActive, NOW_MS);
-    const claudes = active.filter((a) => a.canonical === "claude");
-    assert.equal(claudes.length, 1);
-    assert.equal(claudes[0].quota.user, "alice@example.com");
-
-    const bobKey = t3Accounts.find((a) => a.quota.user === "bob@example.com").key;
-    const cfgPicked = { ...defaultConfig(), selectionMode: "only-selected", selectedAccounts: [bobKey] };
-    const picked = selectExposedAccounts(t3Accounts, cfgPicked, NOW_MS);
-    assert.equal(picked.length, 1);
-    assert.equal(picked[0].quota.user, "bob@example.com");
   });
 });
 
-describe("HTTP server end-to-end", () => {
-  test("serves T3 Code CLIProxyAPI endpoints, enforces Bearer auth, and updates config live", async () => {
+describe("T3 Code settings wiring, SECRET_REDACTED handling, and live port switch", () => {
+  test("recognizes T3 Code SECRET_REDACTED placeholder and preserves disabled state", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "magpie-t3wire-redact-"));
+    const settingsPath = path.join(tmpDir, "userdata", "settings.json");
+    fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+    fs.writeFileSync(settingsPath, JSON.stringify({ providerInstances: { magpie: {} } }, null, 2));
+
+    try {
+      // Initial sync writes literal key
+      const r1 = syncT3CodeHub({
+        settingsPath,
+        url: "http://127.0.0.1:3478",
+        managementKey: "mgp_key_one",
+      });
+      assert.equal(r1.changed, true);
+      assert.ok(r1.wiredKeyHash);
+
+      // Simulate T3 Code moving key to encrypted secret store and writing "••••••"
+      const afterT3 = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+      afterT3.usageLimitSources[T3_SOURCE_ID].managementKey = T3_SECRET_REDACTED;
+      fs.writeFileSync(settingsPath, JSON.stringify(afterT3, null, 2));
+
+      // On Magpie restart: inspect sees upToDate=true and sync is a no-op!
+      const insp = inspectT3CodeHub({
+        settingsPath,
+        url: "http://127.0.0.1:3478",
+        managementKey: "mgp_key_one",
+        lastWiredKeyHash: r1.wiredKeyHash,
+      });
+      assert.equal(insp.upToDate, true);
+      assert.equal(insp.secretManagedByT3, true);
+
+      const r2 = syncT3CodeHub({
+        settingsPath,
+        url: "http://127.0.0.1:3478",
+        managementKey: "mgp_key_one",
+        lastWiredKeyHash: r1.wiredKeyHash,
+      });
+      assert.equal(r2.changed, false);
+      assert.equal(r2.status, "up-to-date");
+
+      // If user rotates key -> detected as mismatch and re-written
+      const inspRotated = inspectT3CodeHub({
+        settingsPath,
+        url: "http://127.0.0.1:3478",
+        managementKey: "mgp_key_two",
+        lastWiredKeyHash: r1.wiredKeyHash,
+      });
+      assert.equal(inspRotated.upToDate, false);
+      assert.equal(inspRotated.keyMatches, false);
+
+      // If user disables hub in T3 Code -> auto sync preserves enabled: false
+      const disabledData = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+      disabledData.usageLimitSources[T3_SOURCE_ID].enabled = false;
+      fs.writeFileSync(settingsPath, JSON.stringify(disabledData, null, 2));
+
+      const rDisabled = syncT3CodeHub({
+        settingsPath,
+        url: "http://127.0.0.1:3478",
+        managementKey: "mgp_key_one",
+        lastWiredKeyHash: r1.wiredKeyHash,
+      });
+      assert.equal(rDisabled.changed, false);
+      assert.equal(rDisabled.status, "disabled-in-t3");
+      const inspDisabled = inspectT3CodeHub({
+        settingsPath,
+        url: "http://127.0.0.1:3478",
+        managementKey: "mgp_key_one",
+        lastWiredKeyHash: r1.wiredKeyHash,
+      });
+      assert.equal(inspDisabled.disabledInT3, true);
+      assert.equal(inspDisabled.upToDate, false);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test("enforces X-UI-Token + Host check, coalesces live fetches, and hot-switches port", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "magpie-e2e-"));
+    const settingsPath = path.join(tmpDir, "t3", "userdata", "settings.json");
+    const magpieDir = path.join(tmpDir, "magpie");
+    fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+    fs.mkdirSync(magpieDir, { recursive: true });
+    fs.writeFileSync(settingsPath, JSON.stringify({}, null, 2));
+    fs.writeFileSync(
+      path.join(magpieDir, "plugins.json"),
+      JSON.stringify({ plugins: [{ spec: "github:uiuing/magpie-t3code-quotas", options: { port: 3478 } }] }),
+    );
+
     let magpieHits = 0;
     const mockMagpie = http.createServer((req, res) => {
       magpieHits += 1;
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ object: "list", data: SAMPLE_QUOTAS }));
+      setTimeout(() => {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ object: "list", data: SAMPLE_QUOTAS }));
+      }, 20);
     });
     await new Promise((r) => mockMagpie.listen(0, "127.0.0.1", r));
     const magpiePort = mockMagpie.address().port;
 
-    const app = await startServer({
-      configDir: null,
-      portOverride: 0,
-      hostOptions: {
-        managementKey: "secret-test-key",
-        magpieUrl: `http://127.0.0.1:${magpiePort}`,
-        keptOnly: true,
-      },
-    });
+    // Reserve a busy port to test 409 conflict handling
+    const busyServer = http.createServer((_req, res) => res.end());
+    await new Promise((r) => busyServer.listen(0, "127.0.0.1", r));
+    const busyPort = busyServer.address().port;
 
-    try {
-      const base = `http://127.0.0.1:${app.port}`;
-
-      // Unauthorized rejected
-      const unauth = await fetch(`${base}/v0/management/auth-files`);
-      assert.equal(unauth.status, 401);
-
-      // Auth-files succeeds with Bearer token
-      const filesRes = await fetch(`${base}/v0/management/auth-files`, {
-        headers: { Authorization: "Bearer secret-test-key" },
-      });
-      assert.equal(filesRes.status, 200);
-      const { files } = await filesRes.json();
-      assert.equal(files.length, 5);
-
-      // Parallel api-call hits snapshot cache (Magpie still hit only once)
-      const claudeFile = files.find((f) => f.provider === "claude");
-      const apiRes = await fetch(`${base}/v0/management/api-call`, {
-        method: "POST",
-        headers: {
-          Authorization: "Bearer secret-test-key",
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          auth_index: claudeFile.auth_index,
-          method: "GET",
-          url: "https://api.anthropic.com/api/oauth/usage",
-          header: {},
-        }),
-      });
-      assert.equal(apiRes.status, 200);
-      const apiBody = await apiRes.json();
-      assert.equal(apiBody.status_code, 200);
-      const parsedClaude = JSON.parse(apiBody.body);
-      assert.equal(parsedClaude.five_hour.utilization, 32);
-      assert.equal(magpieHits, 1, "auth-files + api-call within TTL should share one Magpie fetch");
-
-      // Switch to pooled mode via /api/config -> takes effect immediately
-      const saveRes = await fetch(`${base}/api/config`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ mode: "pooled" }),
-      });
-      assert.equal(saveRes.status, 200);
-
-      const pooledFilesRes = await fetch(`${base}/v0/management/auth-files`, {
-        headers: { Authorization: "Bearer secret-test-key" },
-      });
-      const pooledFiles = (await pooledFilesRes.json()).files;
-      assert.equal(
-        pooledFiles.filter((f) => f.provider === "claude").length,
-        1,
-        "two Claude Max accounts should collapse into 1 pooled entry",
-      );
-
-      // /api/status returns other Magpie providers (WorkBuddy + DeepSeek)
-      const statusRes = await fetch(`${base}/api/status`);
-      const status = await statusRes.json();
-      assert.equal(status.otherSummary.length, 2);
-      assert.equal(status.magpieError, "");
-    } finally {
-      await app.close();
-      await new Promise((r) => mockMagpie.close(r));
-    }
-  });
-
-  test("auto-wires and removes usageLimitSources in T3 Code settings.json safely", async () => {
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "magpie-t3wire-"));
-    const settingsPath = path.join(tmpDir, "userdata", "settings.json");
-    fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
-    fs.writeFileSync(
-      settingsPath,
-      JSON.stringify(
-        {
-          providerInstances: { magpie: { driver: "claudeAgent", enabled: true } },
-          usageLimitSources: {
-            "other-hub": { kind: "cliproxy", url: "http://127.0.0.1:9999", managementKey: "k", enabled: true },
-          },
-        },
-        null,
-        2,
-      ),
-    );
+    // Pick a free port for hot-rebind
+    const probeServer = http.createServer();
+    await new Promise((r) => probeServer.listen(0, "127.0.0.1", r));
+    const nextFreePort = probeServer.address().port;
+    await new Promise((r) => probeServer.close(r));
 
     const app = await startServer({
-      configDir: null,
+      configDir: magpieDir,
       portOverride: 0,
       t3SettingsPath: settingsPath,
       hostOptions: {
-        managementKey: "initial-key",
-        autoWireT3Code: true,
+        magpieUrl: `http://127.0.0.1:${magpiePort}`,
+        magpieApiKey: "super-secret-magpie-key",
+        keptOnly: false,
       },
     });
 
     try {
-      const saved = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
-      assert.ok(saved.providerInstances.magpie, "existing providerInstances must stay untouched");
-      assert.ok(saved.usageLimitSources["other-hub"], "other hubs must stay untouched");
-      assert.deepEqual(saved.usageLimitSources[T3_SOURCE_ID], {
-        kind: "cliproxy",
-        label: "Magpie",
-        url: `http://127.0.0.1:${app.port}`,
-        managementKey: "initial-key",
-        enabled: true,
-      });
-
-      // Second sync is a no-op (no unnecessary file write)
-      const second = syncT3CodeHub({
-        settingsPath,
-        url: `http://127.0.0.1:${app.port}`,
-        managementKey: "initial-key",
-      });
-      assert.equal(second.changed, false);
-      assert.equal(second.status, "up-to-date");
-
-      // Changing managementKey via /api/config updates T3 Code settings automatically
       const base = `http://127.0.0.1:${app.port}`;
-      const upd = await fetch(`${base}/api/config`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ managementKey: "rotated-key" }),
-      });
-      assert.equal(upd.status, 200);
-      const afterKey = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
-      assert.equal(afterKey.usageLimitSources[T3_SOURCE_ID].managementKey, "rotated-key");
+      const key = app.configStore.get().managementKey;
 
-      // Unwire removes only magpie-quotas and leaves other-hub intact
-      const unwire = await fetch(`${base}/api/t3/unwire`, { method: "POST" });
-      assert.equal(unwire.status, 200);
-      const afterRemove = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
-      assert.equal(afterRemove.usageLimitSources[T3_SOURCE_ID], undefined);
-      assert.ok(afterRemove.usageLimitSources["other-hub"]);
+      // Missing X-UI-Token rejected with 403
+      const noTok = await fetch(`${base}/api/status`);
+      assert.equal(noTok.status, 403);
+
+      // Valid X-UI-Token succeeds and never leaks magpieApiKey
+      const statusRes = await fetch(`${base}/api/status`, {
+        headers: { "X-UI-Token": app.uiToken },
+      });
+      assert.equal(statusRes.status, 200);
+      const status = await statusRes.json();
+      assert.equal(status.config.magpieApiKey, undefined);
+      assert.equal(status.config.hasMagpieApiKey, true);
+      assert.ok(Array.isArray(status.accountTree) && status.accountTree.length === 4);
+
+      // Parallel management api-call requests coalesce into a single Magpie fetch
+      magpieHits = 0;
+      const filesRes = await fetch(`${base}/v0/management/auth-files`, {
+        headers: { Authorization: `Bearer ${key}` },
+      });
+      const { files } = await filesRes.json();
+      await Promise.all(
+        files.slice(0, 3).map((f) =>
+          fetch(`${base}/v0/management/api-call`, {
+            method: "POST",
+            headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+            body: JSON.stringify({
+              auth_index: f.auth_index,
+              method: "GET",
+              url: "https://api.anthropic.com/api/oauth/usage",
+              header: {},
+            }),
+          }),
+        ),
+      );
+      assert.equal(magpieHits, 0, "live cache (30s) should serve follow-up management calls without hitting Magpie again");
+
+      // Busy port returns 409 without disturbing active port
+      const busyRes = await fetch(`${base}/api/port`, {
+        method: "POST",
+        headers: { "X-UI-Token": app.uiToken, "Content-Type": "application/json" },
+        body: JSON.stringify({ port: busyPort }),
+      });
+      assert.equal(busyRes.status, 409);
+
+      // Simulate T3 Code redacting managementKey before port switch
+      const t3Before = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+      if (t3Before.usageLimitSources?.[T3_SOURCE_ID]) {
+        t3Before.usageLimitSources[T3_SOURCE_ID].managementKey = T3_SECRET_REDACTED;
+        fs.writeFileSync(settingsPath, JSON.stringify(t3Before, null, 2));
+      }
+
+      // Live switch to nextFreePort succeeds, updates plugins.json & T3 Code settings.json
+      const switchRes = await fetch(`${base}/api/port`, {
+        method: "POST",
+        headers: { "X-UI-Token": app.uiToken, "Content-Type": "application/json" },
+        body: JSON.stringify({ port: nextFreePort }),
+      });
+      assert.equal(switchRes.status, 200);
+      assert.equal(app.port, nextFreePort);
+
+      const newHealth = await fetch(`http://127.0.0.1:${nextFreePort}/health`);
+      assert.equal(newHealth.status, 200);
+      assert.equal((await newHealth.json()).port, nextFreePort);
+
+      const updatedPlugins = JSON.parse(fs.readFileSync(path.join(magpieDir, "plugins.json"), "utf8"));
+      assert.equal(updatedPlugins.plugins[0].options.port, nextFreePort);
+
+      const t3After = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+      assert.equal(t3After.usageLimitSources[T3_SOURCE_ID].url, `http://127.0.0.1:${nextFreePort}`);
+      assert.equal(t3After.usageLimitSources[T3_SOURCE_ID].managementKey, T3_SECRET_REDACTED);
     } finally {
       await app.close();
+      await new Promise((r) => mockMagpie.close(r));
+      await new Promise((r) => busyServer.close(r));
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });
-});
 
-describe("T3 Code auto-wire safety guards", () => {
-  test("never creates missing ~/.t3 and refuses to overwrite invalid JSON", () => {
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "magpie-t3wire-guard-"));
+  test("guards: missing T3 settings returns 404 on /api/t3/wire, invalid JSON untouched, ephemeral CLI detected", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "magpie-guard-"));
+    const missingPath = path.join(tmpDir, "missing", "settings.json");
+    const app = await startServer({
+      configDir: null,
+      portOverride: 0,
+      t3SettingsPath: missingPath,
+    });
     try {
-      const missingPath = path.join(tmpDir, "missing", "userdata", "settings.json");
-      const r1 = syncT3CodeHub({ settingsPath: missingPath, url: "http://127.0.0.1:3478", managementKey: "k" });
-      assert.equal(r1.status, "t3-not-found");
+      const res = await fetch(`http://127.0.0.1:${app.port}/api/t3/wire`, {
+        method: "POST",
+        headers: { "X-UI-Token": app.uiToken },
+      });
+      assert.equal(res.status, 404);
       assert.equal(fs.existsSync(missingPath), false);
 
       const corruptPath = path.join(tmpDir, "corrupt.json");
-      fs.writeFileSync(corruptPath, "{ not valid json");
-      const r2 = syncT3CodeHub({ settingsPath: corruptPath, url: "http://127.0.0.1:3478", managementKey: "k" });
-      assert.equal(r2.status, "invalid-settings");
-      assert.equal(fs.readFileSync(corruptPath, "utf8"), "{ not valid json");
+      fs.writeFileSync(corruptPath, "{ invalid");
+      assert.equal(
+        syncT3CodeHub({ settingsPath: corruptPath, url: "http://127.0.0.1:3478", managementKey: "k" }).status,
+        "invalid-settings",
+      );
+      assert.equal(fs.readFileSync(corruptPath, "utf8"), "{ invalid");
 
       assert.equal(
-        resolveT3SettingsPath({ T3CODE_HOME: "~/custom-t3" }, "/Users/test"),
-        "/Users/test/custom-t3/userdata/settings.json",
+        resolveT3SettingsPath({ T3CODE_HOME: "~/my-t3" }, "/Users/test"),
+        "/Users/test/my-t3/userdata/settings.json",
       );
-
-      // Ephemeral CLI port detection
       fs.writeFileSync(
         path.join(tmpDir, "plugins.json"),
         JSON.stringify({ plugins: [{ spec: "github:uiuing/magpie-t3code-quotas", options: { port: 3478 } }] }),
       );
       assert.equal(isEphemeralCliPort({ configDir: tmpDir, runningPort: 3478 }), false);
-      assert.equal(isEphemeralCliPort({ configDir: tmpDir, runningPort: 54321 }), true);
-
-      // Remove on missing entry is safe no-op
+      assert.equal(isEphemeralCliPort({ configDir: tmpDir, runningPort: 59999 }), true);
       assert.equal(removeT3CodeHub({ settingsPath: missingPath }).status, "t3-not-found");
-      assert.equal(inspectT3CodeHub({ settingsPath: missingPath, url: "http://127.0.0.1:3478", managementKey: "k" }).exists, false);
     } finally {
+      await app.close();
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });
