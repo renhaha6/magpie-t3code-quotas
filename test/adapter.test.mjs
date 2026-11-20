@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import http from "node:http";
+import os from "node:os";
+import path from "node:path";
 import { describe, test } from "node:test";
 import {
   buildAntigravitySummaryPayload,
@@ -15,6 +18,14 @@ import {
 import { defaultConfig, resolveMagpieBaseUrl } from "../lib/config.mjs";
 import { poolQuotasByPlan, summarizeProviderQuotas } from "../lib/pool.mjs";
 import { startServer } from "../lib/server.mjs";
+import {
+  inspectT3CodeHub,
+  isEphemeralCliPort,
+  removeT3CodeHub,
+  resolveT3SettingsPath,
+  syncT3CodeHub,
+  T3_SOURCE_ID,
+} from "../lib/t3wire.mjs";
 
 const NOW_ISO = "2026-11-21T00:00:00.000Z";
 const NOW_MS = Date.parse(NOW_ISO);
@@ -351,6 +362,115 @@ describe("HTTP server end-to-end", () => {
     } finally {
       await app.close();
       await new Promise((r) => mockMagpie.close(r));
+    }
+  });
+
+  test("auto-wires and removes usageLimitSources in T3 Code settings.json safely", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "magpie-t3wire-"));
+    const settingsPath = path.join(tmpDir, "userdata", "settings.json");
+    fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+    fs.writeFileSync(
+      settingsPath,
+      JSON.stringify(
+        {
+          providerInstances: { magpie: { driver: "claudeAgent", enabled: true } },
+          usageLimitSources: {
+            "other-hub": { kind: "cliproxy", url: "http://127.0.0.1:9999", managementKey: "k", enabled: true },
+          },
+        },
+        null,
+        2,
+      ),
+    );
+
+    const app = await startServer({
+      configDir: null,
+      portOverride: 0,
+      t3SettingsPath: settingsPath,
+      hostOptions: {
+        managementKey: "initial-key",
+        autoWireT3Code: true,
+      },
+    });
+
+    try {
+      const saved = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+      assert.ok(saved.providerInstances.magpie, "existing providerInstances must stay untouched");
+      assert.ok(saved.usageLimitSources["other-hub"], "other hubs must stay untouched");
+      assert.deepEqual(saved.usageLimitSources[T3_SOURCE_ID], {
+        kind: "cliproxy",
+        label: "Magpie",
+        url: `http://127.0.0.1:${app.port}`,
+        managementKey: "initial-key",
+        enabled: true,
+      });
+
+      // Second sync is a no-op (no unnecessary file write)
+      const second = syncT3CodeHub({
+        settingsPath,
+        url: `http://127.0.0.1:${app.port}`,
+        managementKey: "initial-key",
+      });
+      assert.equal(second.changed, false);
+      assert.equal(second.status, "up-to-date");
+
+      // Changing managementKey via /api/config updates T3 Code settings automatically
+      const base = `http://127.0.0.1:${app.port}`;
+      const upd = await fetch(`${base}/api/config`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ managementKey: "rotated-key" }),
+      });
+      assert.equal(upd.status, 200);
+      const afterKey = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+      assert.equal(afterKey.usageLimitSources[T3_SOURCE_ID].managementKey, "rotated-key");
+
+      // Unwire removes only magpie-quotas and leaves other-hub intact
+      const unwire = await fetch(`${base}/api/t3/unwire`, { method: "POST" });
+      assert.equal(unwire.status, 200);
+      const afterRemove = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+      assert.equal(afterRemove.usageLimitSources[T3_SOURCE_ID], undefined);
+      assert.ok(afterRemove.usageLimitSources["other-hub"]);
+    } finally {
+      await app.close();
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("T3 Code auto-wire safety guards", () => {
+  test("never creates missing ~/.t3 and refuses to overwrite invalid JSON", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "magpie-t3wire-guard-"));
+    try {
+      const missingPath = path.join(tmpDir, "missing", "userdata", "settings.json");
+      const r1 = syncT3CodeHub({ settingsPath: missingPath, url: "http://127.0.0.1:3478", managementKey: "k" });
+      assert.equal(r1.status, "t3-not-found");
+      assert.equal(fs.existsSync(missingPath), false);
+
+      const corruptPath = path.join(tmpDir, "corrupt.json");
+      fs.writeFileSync(corruptPath, "{ not valid json");
+      const r2 = syncT3CodeHub({ settingsPath: corruptPath, url: "http://127.0.0.1:3478", managementKey: "k" });
+      assert.equal(r2.status, "invalid-settings");
+      assert.equal(fs.readFileSync(corruptPath, "utf8"), "{ not valid json");
+
+      assert.equal(
+        resolveT3SettingsPath({ T3CODE_HOME: "~/custom-t3" }, "/Users/test"),
+        "/Users/test/custom-t3/userdata/settings.json",
+      );
+
+      // Ephemeral CLI port detection
+      fs.writeFileSync(
+        path.join(tmpDir, "plugins.json"),
+        JSON.stringify({ plugins: [{ spec: "github:uiuing/magpie-t3code-quotas", options: { port: 3478 } }] }),
+      );
+      assert.equal(isEphemeralCliPort({ configDir: tmpDir, runningPort: 3478 }), false);
+      assert.equal(isEphemeralCliPort({ configDir: tmpDir, runningPort: 54321 }), true);
+
+      // Remove on missing entry is safe no-op
+      assert.equal(removeT3CodeHub({ settingsPath: missingPath }).status, "t3-not-found");
+      assert.equal(inspectT3CodeHub({ settingsPath: missingPath, url: "http://127.0.0.1:3478", managementKey: "k" }).exists, false);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });
 });

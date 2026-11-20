@@ -25,7 +25,8 @@ magpie plugin add github:uiuing/magpie-t3code-quotas
 
 安装并开启后：
 - 插件会随 Magpie 自动在本机启动一个只读 HTTP 适配服务（默认 `http://127.0.0.1:3478`）。
-- Magpie 左侧栏会出现 **「T3 Code 额度」** 页面，可以查看实时状态、切换同步模式、按账号勾选、一键复制接入信息。
+- **自动接入 T3 Code（无需手动填表）**：与 Magpie 原生接入 T3 Code 的方式一致，插件会自动往 `~/.t3/userdata/settings.json`（或 `$T3CODE_HOME/userdata/settings.json`）写入 `usageLimitSources["magpie-quotas"]`，保留你原有的全部配置与其他 Hub；T3 Code 监听到文件更新后会自动热加载。
+- Magpie 左侧栏会出现 **「T3 Code 额度」** 页面，可以查看实时状态、切换同步模式、按账号勾选，或一键「从 T3 Code 移除」。
 
 ### 方式二：独立命令行运行（无需装进 Magpie）
 
@@ -39,13 +40,11 @@ node serve.mjs
 
 ---
 
-## 在 T3 Code 中接入
+## 在 T3 Code 中查看额度
 
-1. 打开 T3 Code 的 **Settings → Providers → Usage providers → Add hub**。
-2. 填入以下信息（也可直接在 Magpie 侧边栏「T3 Code 额度」页一键复制）：
-   - **URL**：`http://127.0.0.1:3478`
-   - **Management Key**：`magpie-t3code-local`（建议在配置页或插件选项中改为自己的本地 Key）
-3. 打开 **Usage → Limits**（快捷键 `Cmd+U` / `Ctrl+U`）或在对话输入框里输入 `/usage-limits`，即可看到 Magpie 中的多账号额度与按套餐汇总进度条。
+本机装完插件后**无需在 T3 Code 里手动添加 Hub**：直接按 `Cmd+U` / `Ctrl+U` 打开 **Usage → Limits**，或在对话输入框输入 `/usage-limits`，即可看到 Magpie 中的多账号额度与按套餐汇总进度条。
+
+> 如果你的 T3 Code 跑在另一台机器，或你在配置页关闭了「自动写入 T3 Code 配置」，也可以在 T3 Code 的 **Settings → Providers → Usage providers → Add hub** 里手动填入 Magpie「T3 Code 额度」页提供的 URL 和 Management Key。
 
 ---
 

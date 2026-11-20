@@ -37,6 +37,7 @@
       "port": 3478,
       "managementKey": "magpie-t3code-local",
       "keptOnly": true,
+      "autoWireT3Code": true,
       "mode": "per-account"
     },
     "page": {
