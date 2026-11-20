@@ -1,0 +1,56 @@
+{
+  "name": "magpie-t3code-quotas",
+  "version": "0.1.0",
+  "description": "Minimal Magpie plugin that exposes Magpie subscription quotas to T3 Code via its native CLIProxyAPI Usage Hub protocol.",
+  "type": "module",
+  "main": "./index.mjs",
+  "scripts": {
+    "start": "bun serve.mjs",
+    "test": "bun test"
+  },
+  "keywords": [
+    "magpie",
+    "magpie-plugin",
+    "magpie-page",
+    "opencode-plugin",
+    "t3code",
+    "quota",
+    "usage"
+  ],
+  "license": "MIT",
+  "files": [
+    "index.mjs",
+    "serve.mjs",
+    "lib",
+    "page",
+    "README.md",
+    "LICENSE"
+  ],
+  "magpie": {
+    "name": "T3 Code 额度适配",
+    "summary": {
+      "en": "Expose Magpie subscription quotas to T3 Code via its native Usage Hub protocol",
+      "zh": "通过 T3 Code 原生 Usage Hub 协议将 Magpie 多账号额度适配给 T3 Code 查阅"
+    },
+    "icon": "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA2NCA2NCIgd2lkdGg9IjY0IiBoZWlnaHQ9IjY0Ij48cmVjdCB3aWR0aD0iNjQiIGhlaWdodD0iNjQiIHJ4PSIxNCIgZmlsbD0iIzBmMTcyYSIvPjxwYXRoIGQ9Ik0xNiAyMmgzMm0tMTYgMHYyNG0xMC0xNmgxNHY2SDM2em0wIDEyaDEwdjZIMzZ6IiBzdHJva2U9IiMzOGJkZjgiIHN0cm9rZS13aWR0aD0iNCIgc3Ryb2tlLWxpbmVjYXA9InJvdW5kIiBzdHJva2UtbGluZWpvaW49InJvdW5kIiBmaWxsPSJub25lIi8+PC9zdmc+",
+    "options": {
+      "port": 3478,
+      "managementKey": "magpie-t3code-local",
+      "keptOnly": true,
+      "mode": "per-account"
+    },
+    "page": {
+      "title": "T3 Code Quotas",
+      "titles": {
+        "zh": "T3 Code 额度",
+        "zh-TW": "T3 Code 額度"
+      },
+      "file": "page/index.html",
+      "icon": "page/icon.svg",
+      "service": {
+        "port": 3478,
+        "option": "port"
+      }
+    }
+  }
+}
