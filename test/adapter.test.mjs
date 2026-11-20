@@ -401,6 +401,61 @@ describe("3-level plan/account filtering & pooled reset strategies", () => {
     assert.equal(otherGroup.channels.some((c) => c.provider === "workbuddy" && !c.t3Supported), true);
     assert.equal(otherGroup.channels.some((c) => c.provider === "deepseek" && c.balances.length === 1), true);
   });
+
+  test("adaptive auto mode pools providers exceeding threshold while keeping smaller providers expanded", () => {
+    const many = [
+      ...Array.from({ length: 6 }, (_, i) => ({
+        provider: "claude",
+        plan: "pro",
+        user: `c${i + 1}@example.com`,
+        kind: "subscription",
+        windows: [{ name: "5 hours", used: 20, resetsAt: "2026-11-21T03:00:00Z" }],
+      })),
+      {
+        provider: "codex",
+        plan: "plus",
+        user: "x1@example.com",
+        kind: "subscription",
+        windows: [{ name: "5 hours", used: 10, resetsAt: "2026-11-21T03:00:00Z" }],
+      },
+      {
+        provider: "codex",
+        plan: "plus",
+        user: "x2@example.com",
+        kind: "subscription",
+        windows: [{ name: "5 hours", used: 40, resetsAt: "2026-11-21T04:00:00Z" }],
+      },
+    ];
+    const { t3Accounts } = classifyMagpieQuotas(many);
+
+    // Default threshold = 4 -> 6 Claude accounts auto-pool to 1; 2 Codex accounts stay expanded (2)
+    const cfg4 = { ...defaultConfig(), mode: "auto", autoPoolThreshold: 4 };
+    const exp4 = selectExposedAccounts(t3Accounts, cfg4, NOW_MS);
+    const claudeOut = exp4.filter((a) => a.canonical === "claude");
+    const codexOut = exp4.filter((a) => a.canonical === "codex");
+    assert.equal(claudeOut.length, 1);
+    assert.equal(claudeOut[0].pooledCount, 6);
+    assert.equal(codexOut.length, 2);
+
+    // Threshold = 6 -> 6 Claude accounts stay expanded too
+    const cfg6 = { ...defaultConfig(), mode: "auto", autoPoolThreshold: 6 };
+    const exp6 = selectExposedAccounts(t3Accounts, cfg6, NOW_MS);
+    assert.equal(exp6.filter((a) => a.canonical === "claude").length, 6);
+
+    // Threshold = 1 -> both Claude (6) and Codex (2) auto-pool
+    const cfg1 = { ...defaultConfig(), mode: "auto", autoPoolThreshold: 1 };
+    const exp1 = selectExposedAccounts(t3Accounts, cfg1, NOW_MS);
+    assert.equal(exp1.filter((a) => a.canonical === "claude").length, 1);
+    assert.equal(exp1.filter((a) => a.canonical === "codex").length, 1);
+
+    // Config store validates autoPoolThreshold bounds (1..50)
+    const store = createConfigStore({ configDir: null });
+    assert.equal(store.get().mode, "auto");
+    assert.equal(store.get().autoPoolThreshold, 4);
+    assert.equal(store.update({ autoPoolThreshold: 6 }).autoPoolThreshold, 6);
+    assert.equal(store.update({ autoPoolThreshold: 0 }).autoPoolThreshold, 6);
+    assert.equal(store.update({ autoPoolThreshold: 99 }).autoPoolThreshold, 6);
+  });
 });
 
 describe("T3 Code settings wiring, SECRET_REDACTED handling, and live port switch", () => {
@@ -541,18 +596,23 @@ describe("T3 Code settings wiring, SECRET_REDACTED handling, and live port switc
       const status = await statusRes.json();
       assert.equal(status.config.magpieApiKey, undefined);
       assert.equal(status.config.hasMagpieApiKey, true);
+      assert.equal(status.config.mode, "auto");
+      assert.equal(status.config.autoPoolThreshold, 4);
       assert.equal(status.config.resetMergeWindowSecs, 300);
       assert.ok(Array.isArray(status.accountTree) && status.accountTree.length === 4);
+      assert.equal(status.accountTree[0].effectiveMode, "auto-per-account");
       assert.ok(Array.isArray(status.modelGroups) && status.modelGroups.length >= 4);
 
-      // Persist resetMergeWindowSecs (e.g., 30 seconds) via /api/config
+      // Persist resetMergeWindowSecs (e.g., 30 seconds) & autoPoolThreshold via /api/config
       const rwRes = await fetch(`${base}/api/config`, {
         method: "POST",
         headers: { "X-UI-Token": app.uiToken, "Content-Type": "application/json" },
-        body: JSON.stringify({ resetMergeWindowSecs: 30 }),
+        body: JSON.stringify({ resetMergeWindowSecs: 30, autoPoolThreshold: 6 }),
       });
       assert.equal(rwRes.status, 200);
-      assert.equal((await rwRes.json()).config.resetMergeWindowSecs, 30);
+      const rwJson = await rwRes.json();
+      assert.equal(rwJson.config.resetMergeWindowSecs, 30);
+      assert.equal(rwJson.config.autoPoolThreshold, 6);
 
       // Parallel management api-call requests coalesce into a single Magpie fetch
       magpieHits = 0;
