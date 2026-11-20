@@ -11,12 +11,13 @@ import {
   buildCodexCreditsPayload,
   buildCodexUsagePayload,
   buildGrokUsagePayload,
+  buildModelGroups,
   classifyMagpieQuotas,
   handleManagementApiCall,
   selectExposedAccounts,
 } from "../lib/adapter.mjs";
 import { createConfigStore, defaultConfig, resolveMagpieBaseUrl } from "../lib/config.mjs";
-import { poolQuotasByPlan, summarizeProviderQuotas } from "../lib/pool.mjs";
+import { clusterResetWaves, poolQuotasByPlan, summarizeProviderQuotas } from "../lib/pool.mjs";
 import { isAllowedHostHeader, startServer } from "../lib/server.mjs";
 import {
   inspectT3CodeHub,
@@ -302,6 +303,104 @@ describe("3-level plan/account filtering & pooled reset strategies", () => {
     );
     assert.equal(summary.windows[0].used, 20);
   });
+
+  test("configurable resetMergeWindowSecs (seconds & minutes) clusters nearby waves and controls when-aligned strategy", () => {
+    const closeQuotas = [
+      {
+        provider: "claude",
+        plan: "max",
+        user: "a@example.com",
+        windows: [{ name: "5 hours", used: 60, resetsAt: "2026-11-21T02:00:00Z" }],
+      },
+      {
+        provider: "claude",
+        plan: "max",
+        user: "b@example.com",
+        windows: [{ name: "5 hours", used: 80, resetsAt: "2026-11-21T02:00:25Z" }],
+      },
+    ];
+    const itemsClose = classifyMagpieQuotas(closeQuotas).t3Accounts;
+
+    // 25s apart <= 30s window -> aligned, emits latestResetAt
+    const aligned = poolQuotasByPlan(itemsClose, NOW_MS, {
+      resetStrategy: "when-aligned",
+      resetMergeWindowSecs: 30,
+    });
+    const wAligned = aligned[0].quota.windows[0];
+    assert.equal(wAligned.allResetsAligned, true);
+    assert.equal(wAligned.resetWaves.length, 1);
+    assert.equal(wAligned.resetWaves[0].count, 2);
+    assert.equal(wAligned.resetWaves[0].restorePercent, 70);
+    assert.equal(wAligned.resetsAt, "2026-11-21T02:00:25.000Z");
+
+    // 25s apart > 10s window -> NOT aligned, when-aligned omits resetsAt
+    const split10s = poolQuotasByPlan(itemsClose, NOW_MS, {
+      resetStrategy: "when-aligned",
+      resetMergeWindowSecs: 10,
+    });
+    const wSplit = split10s[0].quota.windows[0];
+    assert.equal(wSplit.allResetsAligned, false);
+    assert.equal(wSplit.resetWaves.length, 2);
+    assert.equal(wSplit.resetsAt, undefined);
+
+    // Anchor-based clustering prevents chaining (0s, +20s, +40s with 30s window -> [2, 1])
+    const waves = clusterResetWaves(
+      [
+        { ms: NOW_MS + 3_600_000, used: 100 },
+        { ms: NOW_MS + 3_620_000, used: 100 },
+        { ms: NOW_MS + 3_640_000, used: 100 },
+      ],
+      3,
+      30,
+    );
+    assert.equal(waves.length, 2);
+    assert.equal(waves[0].count, 2);
+    assert.equal(waves[0].restorePercent, 67);
+    assert.equal(waves[1].count, 1);
+    assert.equal(waves[1].restorePercent, 33);
+
+    // Config validation for resetMergeWindowSecs + legacy resetMergeWindowMins conversion
+    const store = createConfigStore({ configDir: null });
+    assert.equal(store.get().resetMergeWindowSecs, 300);
+    assert.equal(store.update({ resetMergeWindowSecs: 0 }).resetMergeWindowSecs, 0);
+    assert.equal(store.update({ resetMergeWindowSecs: 30 }).resetMergeWindowSecs, 30);
+    assert.equal(store.update({ resetMergeWindowMins: 2 }).resetMergeWindowSecs, 120);
+    assert.equal(store.update({ resetMergeWindowSecs: -5 }).resetMergeWindowSecs, 120);
+    assert.equal(store.update({ resetMergeWindowSecs: 99999 }).resetMergeWindowSecs, 120);
+  });
+
+  test("buildModelGroups groups channels across providers by model family without summing scales", () => {
+    const { t3Accounts, otherAccounts } = classifyMagpieQuotas(SAMPLE_QUOTAS);
+    const cfg = { ...defaultConfig(), excludedPlans: ["claude:pro"] };
+    const exposed = selectExposedAccounts(t3Accounts, cfg, NOW_MS);
+    const groups = buildModelGroups(t3Accounts, otherAccounts, exposed, cfg, NOW_MS);
+
+    const claudeGroup = groups.find((g) => g.id === "claude");
+    assert.ok(claudeGroup);
+    // Claude max (synced), Antigravity 3P shared pool (synced), Claude pro (unchecked)
+    assert.equal(claudeGroup.channels.some((c) => c.provider === "claude" && c.plan === "max" && c.syncedAccounts === 2), true);
+    assert.equal(claudeGroup.channels.some((c) => c.provider === "claude" && c.plan === "pro" && c.syncedAccounts === 0), true);
+    const agyClaude = claudeGroup.channels.find((c) => c.provider === "antigravity");
+    assert.ok(agyClaude);
+    assert.equal(agyClaude.sharedPool, true);
+    assert.equal(agyClaude.windows.every((w) => !/gemini/i.test(w.name)), true);
+
+    const codexGroup = groups.find((g) => g.id === "codex");
+    assert.ok(codexGroup);
+    assert.equal(codexGroup.channels.some((c) => c.provider === "codex"), true);
+    assert.equal(codexGroup.channels.some((c) => c.provider === "antigravity" && c.sharedPool), true);
+
+    const geminiGroup = groups.find((g) => g.id === "gemini");
+    assert.ok(geminiGroup);
+    assert.equal(geminiGroup.channels.length, 1);
+    assert.equal(geminiGroup.channels[0].provider, "antigravity");
+    assert.equal(geminiGroup.channels[0].windows.every((w) => /gemini/i.test(w.name)), true);
+
+    const otherGroup = groups.find((g) => g.id === "other");
+    assert.ok(otherGroup);
+    assert.equal(otherGroup.channels.some((c) => c.provider === "workbuddy" && !c.t3Supported), true);
+    assert.equal(otherGroup.channels.some((c) => c.provider === "deepseek" && c.balances.length === 1), true);
+  });
 });
 
 describe("T3 Code settings wiring, SECRET_REDACTED handling, and live port switch", () => {
@@ -442,7 +541,18 @@ describe("T3 Code settings wiring, SECRET_REDACTED handling, and live port switc
       const status = await statusRes.json();
       assert.equal(status.config.magpieApiKey, undefined);
       assert.equal(status.config.hasMagpieApiKey, true);
+      assert.equal(status.config.resetMergeWindowSecs, 300);
       assert.ok(Array.isArray(status.accountTree) && status.accountTree.length === 4);
+      assert.ok(Array.isArray(status.modelGroups) && status.modelGroups.length >= 4);
+
+      // Persist resetMergeWindowSecs (e.g., 30 seconds) via /api/config
+      const rwRes = await fetch(`${base}/api/config`, {
+        method: "POST",
+        headers: { "X-UI-Token": app.uiToken, "Content-Type": "application/json" },
+        body: JSON.stringify({ resetMergeWindowSecs: 30 }),
+      });
+      assert.equal(rwRes.status, 200);
+      assert.equal((await rwRes.json()).config.resetMergeWindowSecs, 30);
 
       // Parallel management api-call requests coalesce into a single Magpie fetch
       magpieHits = 0;
@@ -464,7 +574,8 @@ describe("T3 Code settings wiring, SECRET_REDACTED handling, and live port switc
           }),
         ),
       );
-      assert.equal(magpieHits, 0, "live cache (30s) should serve follow-up management calls without hitting Magpie again");
+      // Config update invalidated cache; auth-files + 3 parallel api-calls should hit Magpie only once
+      assert.equal(magpieHits, 1, "live cache (30s) should serve follow-up management calls without hitting Magpie again");
 
       // Busy port returns 409 without disturbing active port
       const busyRes = await fetch(`${base}/api/port`, {
