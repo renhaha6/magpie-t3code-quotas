@@ -329,9 +329,13 @@ describe("3-level plan/account filtering & pooled reset strategies", () => {
       NOW_MS,
       { resetStrategy: "when-aligned" },
     );
-    assert.equal(withUnknown.windows[0].resetCoverageComplete, false);
-    assert.equal(withUnknown.windows[0].allResetsAligned, false);
-    assert.equal(withUnknown.windows[0].resetsAt, undefined);
+    // An unreadable account is left out of the figure (as Magpie's mergeQuotas does),
+    // so it neither drags the percentage nor hides the counted accounts' refill time.
+    assert.equal(withUnknown.unknown, 1);
+    assert.equal(withUnknown.windows[0].used, 40);
+    assert.equal(withUnknown.windows[0].resetCoverageComplete, true);
+    assert.equal(withUnknown.windows[0].allResetsAligned, true);
+    assert.equal(withUnknown.windows[0].resetsAt, "2026-11-21T03:00:00.000Z");
 
     // Stale asOf still excluded in summary
     const summary = summarizeProviderQuotas(
@@ -342,6 +346,55 @@ describe("3-level plan/account filtering & pooled reset strategies", () => {
       NOW_MS,
     );
     assert.equal(summary.windows[0].used, 20);
+  });
+
+  test("a stale weekly window (its reset already passed) never hides the pool's full-refill time", () => {
+    // Shape of the real Claude pool behind the report: one cached account's 7-day
+    // window was used up and reset before now, so its reading is stale. The others
+    // still have refills to come; the latest of them is the full-refill time.
+    const now = Date.parse("2026-11-21T00:50:00Z");
+    const quotas = [
+      { provider: "claude", plan: "pro", windows: [
+        { name: "5 hours", used: 44, resetsAt: "2026-11-21T05:40:00Z" },
+        { name: "7 days", used: 32, resetsAt: "2026-11-25T04:00:00Z" },
+      ] },
+      { provider: "claude", plan: "pro", asOf: "2026-11-18T18:53:18Z", windows: [
+        { name: "5 hours", used: 0 },
+        { name: "7 days", used: 100, resetsAt: "2026-11-21T00:00:00Z" },
+      ] },
+      { provider: "claude", plan: "pro", asOf: "2026-11-18T18:53:18Z", windows: [
+        { name: "5 hours", used: 0 },
+        { name: "7 days", used: 100, resetsAt: "2026-11-21T10:00:00Z" },
+      ] },
+      { provider: "claude", plan: "pro", asOf: "2026-11-19T16:05:46Z", windows: [
+        { name: "5 hours", used: 0 },
+        { name: "7 days", used: 0 },
+      ] },
+      { provider: "claude", plan: "pro", asOf: "2026-11-19T06:31:29Z", windows: [
+        { name: "5 hours", used: 0 },
+        { name: "7 days", used: 13, resetsAt: "2026-11-25T20:00:00Z" },
+      ] },
+    ];
+
+    for (const strategy of ["latest", "earliest", "average"]) {
+      const weekly = summarizeProviderQuotas(quotas, now, { resetStrategy: strategy })
+        .windows.find((w) => w.name === "7 days");
+      assert.equal(weekly.stale, 1);
+      assert.equal(weekly.accounts, 4);
+      assert.equal(weekly.used, Math.round((10 * (32 + 100 + 0 + 13)) / 4) / 10);
+      assert.equal(weekly.resetCoverageComplete, true);
+      assert.ok(weekly.resetsAt, `${strategy} must show a weekly reset time`);
+    }
+
+    const pooled = poolQuotasByPlan(
+      quotas.map((quota, i) => ({ key: `k${i}`, canonical: "claude", t3Provider: "claude", quota })),
+      now,
+      { resetStrategy: "latest", lang: "zh-CN" },
+    );
+    const payload = buildClaudeUsagePayload(pooled[0].quota, now);
+    assert.equal(payload.seven_day.resets_at, "2026-11-25T20:00:00.000Z");
+    // The 5-hour window of the account held by its used-up week counts as used until then.
+    assert.equal(payload.five_hour.resets_at, "2026-11-21T10:00:00.000Z");
   });
 
   test("configurable resetMergeWindowSecs (seconds & minutes) clusters nearby waves and controls when-aligned strategy", () => {
