@@ -613,7 +613,9 @@ describe("T3 Code settings wiring, SECRET_REDACTED handling, and live port switc
       assert.equal(status.accountTree[0].effectiveMode, "auto-per-account");
       assert.ok(Array.isArray(status.modelGroups) && status.modelGroups.length >= 4);
 
-      // Persist resetMergeWindowSecs (e.g., 30 seconds) & autoPoolThreshold via /api/config
+      // Persist resetMergeWindowSecs (e.g., 30 seconds) & autoPoolThreshold via /api/config.
+      // Display-only config changes reuse cached quotas and return updated status inline without hitting Magpie.
+      magpieHits = 0;
       const rwRes = await fetch(`${base}/api/config`, {
         method: "POST",
         headers: { "X-UI-Token": app.uiToken, "Content-Type": "application/json" },
@@ -623,8 +625,21 @@ describe("T3 Code settings wiring, SECRET_REDACTED handling, and live port switc
       const rwJson = await rwRes.json();
       assert.equal(rwJson.config.resetMergeWindowSecs, 30);
       assert.equal(rwJson.config.autoPoolThreshold, 6);
+      assert.equal(rwJson.status.config.resetMergeWindowSecs, 30);
+      assert.equal(rwJson.status.totalT3Accounts, 6);
+      assert.equal(magpieHits, 0, "display config changes must not re-fetch Magpie");
 
-      // Parallel management api-call requests coalesce into a single Magpie fetch
+      // Changing fetch source (keptOnly) invalidates cache; parallel management calls coalesce into 1 fetch.
+      await fetch(`${base}/api/config`, {
+        method: "POST",
+        headers: { "X-UI-Token": app.uiToken, "Content-Type": "application/json" },
+        body: JSON.stringify({ keptOnly: true }),
+      });
+      await fetch(`${base}/api/config`, {
+        method: "POST",
+        headers: { "X-UI-Token": app.uiToken, "Content-Type": "application/json" },
+        body: JSON.stringify({ keptOnly: false }),
+      });
       magpieHits = 0;
       const filesRes = await fetch(`${base}/v0/management/auth-files`, {
         headers: { Authorization: `Bearer ${key}` },
@@ -644,7 +659,6 @@ describe("T3 Code settings wiring, SECRET_REDACTED handling, and live port switc
           }),
         ),
       );
-      // Config update invalidated cache; auth-files + 3 parallel api-calls should hit Magpie only once
       assert.equal(magpieHits, 1, "live cache (30s) should serve follow-up management calls without hitting Magpie again");
 
       // Busy port returns 409 without disturbing active port
