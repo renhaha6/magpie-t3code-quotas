@@ -280,32 +280,26 @@ describe("3-level plan/account filtering & pooled reset strategies", () => {
     const wNone = pooledNone[0].quota.windows.find((w) => w.name === "5 hours");
     assert.equal(wNone.used, 66); // alice 32 + bob held 100 -> 66
     assert.equal(wNone.resetsAt, undefined, "none strategy must omit misleading single resetsAt");
-    // Bob's 5h window is held by his exhausted 7-day window (2026-11-25T00:00:00Z),
-    // so Alice (03:00) refills soonest and full refill isn't until Bob's 7-day reset.
+    // Bob's 5h window is held by his exhausted 7-day window (2026-11-25T00:00:00Z):
+    // it counts as used, but its wait belongs to the 7-day row, so neither his own
+    // 5h reset (02:00, which frees nothing) nor his week's reset sets the 5h time.
+    assert.equal(wNone.held, 1);
     assert.equal(wNone.soonestResetAt, "2026-11-21T03:00:00.000Z");
-    assert.equal(wNone.latestResetAt, "2026-11-25T00:00:00.000Z");
+    assert.equal(wNone.latestResetAt, "2026-11-21T03:00:00.000Z");
     assert.equal(wNone.soonestResetCount, 1);
+    assert.equal(wNone.resetCoverageComplete, true);
 
-    const pooledEarliest = poolQuotasByPlan(claudeMax, NOW_MS, { resetStrategy: "earliest" });
-    assert.equal(
-      pooledEarliest[0].quota.windows.find((w) => w.name === "5 hours").resetsAt,
-      "2026-11-21T03:00:00.000Z",
-    );
-
-    const pooledLatest = poolQuotasByPlan(claudeMax, NOW_MS, { resetStrategy: "latest" });
-    assert.equal(
-      pooledLatest[0].quota.windows.find((w) => w.name === "5 hours").resetsAt,
-      "2026-11-25T00:00:00.000Z",
-    );
-
-    const pooledAverage = poolQuotasByPlan(claudeMax, NOW_MS, { resetStrategy: "average", lang: "zh-CN" });
-    assert.equal(
-      pooledAverage[0].quota.windows.find((w) => w.name === "5 hours").resetsAt,
-      new Date(
-        Math.round((Date.parse("2026-11-21T03:00:00.000Z") + Date.parse("2026-11-25T00:00:00.000Z")) / 2),
-      ).toISOString(),
-    );
-    assert.equal(pooledAverage[0].displayLabel, "2 个账号 · max（平均）");
+    for (const strategy of ["earliest", "latest", "average"]) {
+      const pooled = poolQuotasByPlan(claudeMax, NOW_MS, { resetStrategy: strategy, lang: "zh-CN" });
+      assert.equal(
+        pooled[0].quota.windows.find((w) => w.name === "5 hours").resetsAt,
+        "2026-11-21T03:00:00.000Z",
+        `${strategy}: a held account never stretches the 5h reset to its week's reset`,
+      );
+      // The 7-day row still carries the held account's week reset.
+      const weekly = pooled[0].quota.windows.find((w) => w.name === "7 days");
+      assert.ok(weekly.latestResetAt >= "2026-11-25T00:00:00.000Z");
+    }
 
     // Incomplete reset coverage (unclocked consumed account, stale or unreadable account)
     // must NOT promise a full-refill ("latest") or aligned timestamp.
@@ -346,6 +340,26 @@ describe("3-level plan/account filtering & pooled reset strategies", () => {
       NOW_MS,
     );
     assert.equal(summary.windows[0].used, 20);
+  });
+
+  test("an account with nothing used never sets when the pool has all reset", () => {
+    // Live shape: a week that just reset reads 0% used with a reset 7 days out.
+    // It has nothing to bring back, so the pool's last reset is the used account's.
+    const now = Date.parse("2026-11-21T01:00:00Z");
+    const quotas = [
+      { provider: "claude", plan: "pro", windows: [{ name: "7 days", used: 14, resetsAt: "2026-11-25T20:00:00Z" }] },
+      { provider: "claude", plan: "pro", windows: [{ name: "7 days", used: 0, resetsAt: "2026-11-27T23:59:00Z" }] },
+      { provider: "claude", plan: "pro", windows: [{ name: "7 days", used: 30, resetsAt: "2026-11-22T06:00:00Z" }] },
+    ];
+    const latest = summarizeProviderQuotas(quotas, now, { resetStrategy: "latest" }).windows[0];
+    assert.equal(latest.accounts, 3);
+    assert.equal(latest.used, Math.round((10 * 44) / 3) / 10);
+    assert.equal(latest.resetsAt, "2026-11-25T20:00:00.000Z");
+    const earliest = summarizeProviderQuotas(quotas, now, { resetStrategy: "earliest" }).windows[0];
+    assert.equal(earliest.resetsAt, "2026-11-22T06:00:00.000Z");
+    // Nothing used anywhere: nothing to wait for, so no time is shown.
+    const fresh = summarizeProviderQuotas([quotas[1], quotas[1]], now, { resetStrategy: "latest" }).windows[0];
+    assert.equal(fresh.resetsAt, undefined);
   });
 
   test("a stale weekly window (its reset already passed) never hides the pool's full-refill time", () => {
@@ -393,8 +407,10 @@ describe("3-level plan/account filtering & pooled reset strategies", () => {
     );
     const payload = buildClaudeUsagePayload(pooled[0].quota, now);
     assert.equal(payload.seven_day.resets_at, "2026-11-25T20:00:00.000Z");
-    // The 5-hour window of the account held by its used-up week counts as used until then.
-    assert.equal(payload.five_hour.resets_at, "2026-11-21T10:00:00.000Z");
+    // The account held by its used-up week (until 10:00Z) counts as used, but its
+    // wait is the week's: the 5-hour time is the last real 5-hour reset.
+    assert.equal(payload.five_hour.resets_at, "2026-11-21T05:40:00.000Z");
+    assert.equal(payload.five_hour.utilization, Math.round((10 * (44 + 100 + 0 + 0 + 0)) / 5) / 10);
   });
 
   test("configurable resetMergeWindowSecs (seconds & minutes) clusters nearby waves and controls when-aligned strategy", () => {
@@ -863,9 +879,9 @@ describe("i18n, count chip and reset pick", () => {
       { lang: "zh-CN" },
     );
     assert.equal(exposed.length, 1);
-    assert.equal(exposed[0].displayLabel, "max · 12 个账号（全回血）");
+    assert.equal(exposed[0].displayLabel, "max · 12 个账号（全部重置）");
     const files = buildAuthFilesResponse(exposed).files;
-    assert.equal(files[0].email, "max · 12 个账号（全回血）");
+    assert.equal(files[0].email, "max · 12 个账号（全部重置）");
     assert.equal(initials(files[0].email), "M");
   });
 
