@@ -17,7 +17,7 @@ import {
   selectExposedAccounts,
 } from "../lib/adapter.mjs";
 import { createConfigStore, defaultConfig, normalizeConfig, resolveMagpieBaseUrl } from "../lib/config.mjs";
-import { countChipEmail, normalizeLang, resolveLang } from "../lib/i18n.mjs";
+import { formatMergedLabel, normalizeLang, resolveLang } from "../lib/i18n.mjs";
 import { renderUiHtml } from "../lib/ui.mjs";
 import { clusterResetWaves, poolQuotasByPlan, summarizeProviderQuotas } from "../lib/pool.mjs";
 import { isAllowedHostHeader, startServer } from "../lib/server.mjs";
@@ -752,23 +752,38 @@ describe("i18n, count chip and reset pick", () => {
     return `${local[0] ?? ""}${domain[0] ?? ""}`.toUpperCase() || "?";
   };
 
-  test("merged rows show their account count in T3 Code's chip", () => {
-    assert.equal(initials(countChipEmail(5, "5 accounts · Max")), "5");
-    assert.equal(initials(countChipEmail(12, "12 accounts · Max")), "12");
-    assert.equal(initials(countChipEmail(12, "12 个账号 · Max")), "12");
-    assert.equal(initials(countChipEmail(37, "37 個帳號")), "37");
-    assert.equal(initials(countChipEmail(150, "150 accounts")), "99");
+  test("merged rows use clean labels without synthetic @ placeholders", () => {
+    const label5 = formatMergedLabel({ count: 5, plan: "Max", lang: "en" });
+    assert.equal(label5, "5 accounts · Max");
+    assert.equal(initials(label5), "5");
+    assert.ok(!label5.includes("@"));
+
+    const label12Plan = formatMergedLabel({ count: 12, plan: "pro", lang: "zh-CN" });
+    assert.equal(label12Plan, "pro · 12 个账号");
+    assert.equal(initials(label12Plan), "P");
+    assert.ok(!label12Plan.includes("@"));
+
+    const label12NoPlan = formatMergedLabel({ count: 12, plan: "", lang: "zh-TW" });
+    assert.equal(label12NoPlan, "×12 個帳號");
+    assert.equal(initials(label12NoPlan), "×");
+    assert.ok(!label12NoPlan.includes("@"));
 
     const many = Array.from({ length: 12 }, (_, i) => ({
       provider: "claude", plan: "max", user: `u${i}@example.com`,
-      windows: [{ name: "5 hours", used: 10, resetsAt: "2026-11-21T03:00:00Z" }],
+      windows: [{ name: "5 hours", used: 10, resetsAt: i === 0 ? "2026-11-21T02:00:00Z" : "2026-11-21T05:00:00Z" }],
     }));
-    const { t3Accounts } = classifyMagpieQuotas(many, { lang: "zh-TW" });
-    const exposed = selectExposedAccounts(t3Accounts, { ...defaultConfig(), mode: "auto" }, NOW_MS, { lang: "zh-TW" });
+    const { t3Accounts } = classifyMagpieQuotas(many, { lang: "zh-CN" });
+    const exposed = selectExposedAccounts(
+      t3Accounts,
+      { ...defaultConfig(), mode: "auto", pooledResetStrategy: "latest" },
+      NOW_MS,
+      { lang: "zh-CN" },
+    );
     assert.equal(exposed.length, 1);
-    assert.equal(exposed[0].displayLabel, "12 個帳號 · max");
+    assert.equal(exposed[0].displayLabel, "max · 12 个账号（全回血）");
     const files = buildAuthFilesResponse(exposed).files;
-    assert.equal(initials(files[0].email), "12");
+    assert.equal(files[0].email, "max · 12 个账号（全回血）");
+    assert.equal(initials(files[0].email), "M");
   });
 
   test("language resolution and reset pick normalization", () => {

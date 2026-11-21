@@ -1,6 +1,6 @@
 {
   "name": "magpie-t3code-quotas",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "在 T3 Code 的 Usage → Limits 中直接查看 Magpie 各账号剩余额度。",
   "type": "module",
   "main": "./index.mjs",
