@@ -280,28 +280,58 @@ describe("3-level plan/account filtering & pooled reset strategies", () => {
     const wNone = pooledNone[0].quota.windows.find((w) => w.name === "5 hours");
     assert.equal(wNone.used, 66); // alice 32 + bob held 100 -> 66
     assert.equal(wNone.resetsAt, undefined, "none strategy must omit misleading single resetsAt");
-    assert.equal(wNone.soonestResetAt, "2026-11-21T02:00:00.000Z");
-    assert.equal(wNone.latestResetAt, "2026-11-21T03:00:00.000Z");
+    // Bob's 5h window is held by his exhausted 7-day window (2026-11-25T00:00:00Z),
+    // so Alice (03:00) refills soonest and full refill isn't until Bob's 7-day reset.
+    assert.equal(wNone.soonestResetAt, "2026-11-21T03:00:00.000Z");
+    assert.equal(wNone.latestResetAt, "2026-11-25T00:00:00.000Z");
     assert.equal(wNone.soonestResetCount, 1);
 
     const pooledEarliest = poolQuotasByPlan(claudeMax, NOW_MS, { resetStrategy: "earliest" });
     assert.equal(
       pooledEarliest[0].quota.windows.find((w) => w.name === "5 hours").resetsAt,
-      "2026-11-21T02:00:00.000Z",
+      "2026-11-21T03:00:00.000Z",
     );
 
     const pooledLatest = poolQuotasByPlan(claudeMax, NOW_MS, { resetStrategy: "latest" });
     assert.equal(
       pooledLatest[0].quota.windows.find((w) => w.name === "5 hours").resetsAt,
-      "2026-11-21T03:00:00.000Z",
+      "2026-11-25T00:00:00.000Z",
     );
 
     const pooledAverage = poolQuotasByPlan(claudeMax, NOW_MS, { resetStrategy: "average", lang: "zh-CN" });
     assert.equal(
       pooledAverage[0].quota.windows.find((w) => w.name === "5 hours").resetsAt,
-      "2026-11-21T02:30:00.000Z",
+      new Date(
+        Math.round((Date.parse("2026-11-21T03:00:00.000Z") + Date.parse("2026-11-25T00:00:00.000Z")) / 2),
+      ).toISOString(),
     );
     assert.equal(pooledAverage[0].displayLabel, "2 个账号 · max（平均）");
+
+    // Incomplete reset coverage (unclocked consumed account, stale or unreadable account)
+    // must NOT promise a full-refill ("latest") or aligned timestamp.
+    const unclocked = summarizeProviderQuotas(
+      [
+        { provider: "claude", plan: "pro", windows: [{ name: "5 hours", used: 40, resetsAt: "2026-11-21T03:00:00Z" }] },
+        { provider: "claude", plan: "pro", windows: [{ name: "5 hours", used: 60 }] },
+      ],
+      NOW_MS,
+      { resetStrategy: "latest" },
+    );
+    assert.equal(unclocked.windows[0].resetCoverageComplete, false);
+    assert.equal(unclocked.windows[0].allResetsAligned, false);
+    assert.equal(unclocked.windows[0].resetsAt, undefined, "latest must omit resetsAt when consumed accounts lack reset times");
+
+    const withUnknown = summarizeProviderQuotas(
+      [
+        { provider: "claude", plan: "pro", windows: [{ name: "5 hours", used: 40, resetsAt: "2026-11-21T03:00:00Z" }] },
+        { provider: "claude", plan: "pro", error: "429", windows: [] },
+      ],
+      NOW_MS,
+      { resetStrategy: "when-aligned" },
+    );
+    assert.equal(withUnknown.windows[0].resetCoverageComplete, false);
+    assert.equal(withUnknown.windows[0].allResetsAligned, false);
+    assert.equal(withUnknown.windows[0].resetsAt, undefined);
 
     // Stale asOf still excluded in summary
     const summary = summarizeProviderQuotas(
@@ -813,5 +843,179 @@ describe("i18n, count chip and reset pick", () => {
     assert.doesNotThrow(() => new Function(script));
     assert.ok(!script.includes("tok</script>"));
     for (const word of ["显示方式", "顯示方式", "Display"]) assert.ok(html.includes(word));
+  });
+});
+
+describe("cache source safety & mutation serialization", () => {
+  test("rejects superseded old-source fetches, isolates ?live=1, and preserves 503 error on display save", async () => {
+    let releaseOldFetch;
+    const oldFetchDone = new Promise((r) => { releaseOldFetch = r; });
+    let failNew = false;
+
+    const fakeFetch = async (url) => {
+      if (url.startsWith("http://old-magpie.local")) {
+        await oldFetchDone;
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            data: [{ provider: "claude", plan: "pro", user: "old@example.com", windows: [{ name: "5 hours", used: 10 }] }],
+          }),
+        };
+      }
+      if (failNew) {
+        return { ok: false, status: 503, text: async () => "down" };
+      }
+      const isLive = !url.includes("kept=1");
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          data: [{
+            provider: "claude",
+            plan: isLive ? "max" : "pro",
+            user: isLive ? "live@example.com" : "kept@example.com",
+            windows: [{ name: "5 hours", used: 20 }],
+          }],
+        }),
+      };
+    };
+
+    const app = await startServer({
+      configDir: null,
+      portOverride: 0,
+      t3SettingsPath: null,
+      fetchImpl: fakeFetch,
+      hostOptions: { magpieUrl: "http://old-magpie.local", keptOnly: true },
+    });
+
+    try {
+      const base = `http://127.0.0.1:${app.port}`;
+      const hdr = { "X-UI-Token": app.uiToken };
+      const jsonHdr = { ...hdr, "Content-Type": "application/json" };
+
+      // Start a slow fetch on old-magpie.local
+      const oldStatusPromise = fetch(`${base}/api/status`, { headers: hdr });
+      await new Promise((r) => setTimeout(r, 15));
+
+      // Switch to new-magpie.local BEFORE old fetch finishes
+      const swRes = await fetch(`${base}/api/config`, {
+        method: "POST",
+        headers: jsonHdr,
+        body: JSON.stringify({ magpieUrl: "http://new-magpie.local" }),
+      });
+      const swJson = await swRes.json();
+      assert.equal(swJson.status, undefined, "source change must not inline old status");
+
+      // Let the old fetch finish late — it must NOT pollute the new source's cache
+      releaseOldFetch();
+      const oldStatus = await (await oldStatusPromise).json();
+      assert.equal(oldStatus.config.magpieUrl, "http://old-magpie.local", "GET status must pair its tree with the same request config snapshot");
+
+      // Display save now must NOT inline old-magpie accounts under new-magpie URL
+      const saveAfterOld = await (await fetch(`${base}/api/config`, {
+        method: "POST",
+        headers: jsonHdr,
+        body: JSON.stringify({ mode: "pooled" }),
+      })).json();
+      assert.equal(saveAfterOld.status, undefined, "superseded old-source fetch must not populate cache for new source");
+
+      // ?live=1 must NOT populate the keptOnly cache used by inline config status
+      const liveStatus = await (await fetch(`${base}/api/status?live=1`, { headers: hdr })).json();
+      assert.equal(liveStatus.exposed[0].displayLabel, "live@example.com");
+      const saveAfterLive = await (await fetch(`${base}/api/config`, {
+        method: "POST",
+        headers: jsonHdr,
+        body: JSON.stringify({ mode: "auto" }),
+      })).json();
+      assert.equal(saveAfterLive.status, undefined, "?live=1 cache must not be mistaken for keptOnly snapshot");
+
+      // Warm keptOnly cache, then trigger a 503 manual refresh
+      const warm = await (await fetch(`${base}/api/status`, { headers: hdr })).json();
+      assert.equal(warm.exposed[0].displayLabel, "kept@example.com");
+      failNew = true;
+      const errStatus = await (await fetch(`${base}/api/status?refresh=1`, { headers: hdr })).json();
+      assert.match(errStatus.magpieError, /503/);
+
+      // Follow-up display save must preserve the 503 error instead of reviving stale quotas
+      const saveAfterErr = await (await fetch(`${base}/api/config`, {
+        method: "POST",
+        headers: jsonHdr,
+        body: JSON.stringify({ mode: "per-account" }),
+      })).json();
+      assert.match(saveAfterErr.status.magpieError, /503/);
+      assert.equal(saveAfterErr.status.exposedCount, 0);
+    } finally {
+      await app.close();
+    }
+  });
+
+  test("serializes concurrent /api/port and /api/config key rotation so T3 settings keep new port + new key", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "magpie-race-"));
+    const settingsPath = path.join(tmpDir, "settings.json");
+    fs.writeFileSync(settingsPath, JSON.stringify({ usageLimitSources: {} }));
+
+    const probe = http.createServer();
+    await new Promise((r) => probe.listen(0, "127.0.0.1", r));
+    const nextPort = probe.address().port;
+    await new Promise((r) => probe.close(r));
+
+    const app = await startServer({
+      configDir: tmpDir,
+      portOverride: 0,
+      t3SettingsPath: settingsPath,
+      hostOptions: { autoWireT3Code: true },
+    });
+
+    try {
+      const oldPort = app.port;
+      const oldUrl = `http://127.0.0.1:${oldPort}`;
+      const jsonHdr = { "X-UI-Token": app.uiToken, "Content-Type": "application/json" };
+
+      // Start key rotation request on oldPort (passes Host check), hold its body open
+      // until /api/port finishes switching to nextPort, then finish sending the body.
+      const keyReqPromise = new Promise((resolve, reject) => {
+        const req = http.request(
+          {
+            hostname: "127.0.0.1",
+            port: oldPort,
+            path: "/api/config",
+            method: "POST",
+            headers: jsonHdr,
+          },
+          (res) => {
+            const chunks = [];
+            res.on("data", (c) => chunks.push(c));
+            res.on("end", () =>
+              resolve({ status: res.statusCode, json: JSON.parse(Buffer.concat(chunks).toString("utf8")) }),
+            );
+          },
+        );
+        req.on("error", reject);
+        req.write('{"regenerateKey":');
+        setTimeout(() => {
+          req.end("true}");
+        }, 40);
+      });
+
+      await new Promise((r) => setTimeout(r, 10));
+      const portRes = await fetch(`${oldUrl}/api/port`, {
+        method: "POST",
+        headers: jsonHdr,
+        body: JSON.stringify({ port: nextPort }),
+      });
+      const keyRes = await keyReqPromise;
+      assert.equal(portRes.status, 200);
+      assert.equal(keyRes.status, 200);
+      const keyJson = keyRes.json;
+
+      const t3 = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+      const src = t3.usageLimitSources[T3_SOURCE_ID];
+      assert.equal(src.url, `http://127.0.0.1:${nextPort}`, "T3 Code settings must never regress to the old port");
+      assert.equal(src.managementKey, keyJson.config.managementKey, "T3 Code settings must keep the rotated key");
+    } finally {
+      await app.close();
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
   });
 });

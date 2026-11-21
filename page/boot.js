@@ -1,11 +1,11 @@
 // Bootstrap page inside Magpie's sandboxed iframe (connect-src 'none', frame-src 'none').
 // Navigates the frame to the plugin's own local HTTP service (or magpie.service
-// when viewed remotely through `magpie web`), forwarding Magpie's theme tokens.
-// If the target port is unreachable (plugin off or port busy), offers an inline port
-// switcher powered by Magpie's native `magpie.options.set`.
+// when viewed remotely through `magpie web`), forwarding Magpie's theme tokens,
+// language, and any `_o` browser-origin parameter used by reverse-proxy CSP.
 
 (async () => {
   const DEFAULT_PORT = 3478;
+  const BRIDGE_TIMEOUT_MS = 2500;
   let port = DEFAULT_PORT;
   let savedOptions = {};
   let theme = "";
@@ -13,14 +13,36 @@
   let service = "";
   let lang = "";
 
+  const applyWords = (rawLang) => {
+    const say = words(rawLang || navigator.language);
+    const said0 = document.getElementById("said");
+    if (said0 && !document.getElementById("boot-fallback")) said0.textContent = say.connecting;
+    const title0 = document.getElementById("bootTitle");
+    if (title0) title0.textContent = say.title;
+    return say;
+  };
+
+  // Paint localized status immediately before awaiting Magpie's bridge.
+  let say = applyWords("");
+
+  const withTimeout = (promise, ms) =>
+    Promise.race([
+      Promise.resolve(promise),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("bridge-timeout")), ms)),
+    ]);
+
   try {
-    const t = await window.magpie?.ready;
-    if (t) {
-      if (typeof t.dark === "boolean") theme = t.dark ? "dark" : "light";
-      if (t.tokens && typeof t.tokens === "object") tokens = t.tokens;
-      if (typeof t.lang === "string") lang = t.lang;
+    if (window.magpie?.ready) {
+      const t = await withTimeout(window.magpie.ready, BRIDGE_TIMEOUT_MS);
+      if (t) {
+        if (typeof t.dark === "boolean") theme = t.dark ? "dark" : "light";
+        if (t.tokens && typeof t.tokens === "object") tokens = t.tokens;
+        if (typeof t.lang === "string" && t.lang.trim()) lang = t.lang.trim();
+      }
     }
-  } catch { /* fallback to default theme */ }
+  } catch { /* fallback to browser defaults */ }
+
+  say = applyWords(lang);
 
   try {
     const s = window.magpie?.service;
@@ -28,34 +50,36 @@
   } catch { /* desktop or older magpie */ }
 
   try {
-    const o = await window.magpie?.options?.get?.();
-    if (o && typeof o === "object") {
-      savedOptions = { ...o };
-      if (Number.isFinite(Number(o.port)) && Number(o.port) > 0) {
-        port = Number(o.port);
+    if (window.magpie?.options?.get) {
+      const o = await withTimeout(window.magpie.options.get(), BRIDGE_TIMEOUT_MS);
+      if (o && typeof o === "object") {
+        savedOptions = { ...o };
+        if (Number.isFinite(Number(o.port)) && Number(o.port) > 0) {
+          port = Number(o.port);
+        }
       }
     }
   } catch { /* default port */ }
 
-  const say = words(lang || document.documentElement.lang || navigator.language);
-  const said0 = document.getElementById("said");
-  if (said0) said0.textContent = say.connecting;
-  const title0 = document.getElementById("bootTitle");
-  if (title0) title0.textContent = say.title;
+  const pageParams = new URLSearchParams(location.search);
+  const ownOrigin = pageParams.get("_o");
 
-  const q = new URLSearchParams();
-  if (theme) q.set("theme", theme);
-  if (lang) q.set("lang", lang);
-  const slim = {};
-  for (const [k, v] of Object.entries(tokens || {})) {
-    const s = String(v ?? "").trim();
-    if (s) slim[k] = s;
-  }
-  if (Object.keys(slim).length > 0) {
-    try {
-      q.set("tokens", btoa(unescape(encodeURIComponent(JSON.stringify(slim)))));
-    } catch { /* skip tokens if encoding fails */ }
-  }
+  const applyParams = (u) => {
+    if (theme) u.searchParams.set("theme", theme);
+    if (lang) u.searchParams.set("lang", lang);
+    if (ownOrigin && !u.searchParams.has("_o")) u.searchParams.set("_o", ownOrigin);
+    const slim = {};
+    for (const [k, v] of Object.entries(tokens || {})) {
+      const s = String(v ?? "").trim();
+      if (s) slim[k] = s;
+    }
+    if (Object.keys(slim).length > 0) {
+      try {
+        u.searchParams.set("tokens", btoa(unescape(encodeURIComponent(JSON.stringify(slim)))));
+      } catch { /* skip tokens if encoding fails */ }
+    }
+    return u.toString();
+  };
 
   function armTimeout(p) {
     setTimeout(() => {
@@ -117,14 +141,17 @@
     }, 5000);
   }
 
-  const query = q.toString();
   if (service) {
+    let targetService = service;
+    try {
+      targetService = applyParams(new URL(service, location.href));
+    } catch { /* fallback to raw service URL */ }
     armTimeout(port);
-    location.replace(service + (query ? "?" + query : ""));
+    location.replace(targetService);
     return;
   }
 
-  const target = "http://127.0.0.1:" + port + "/" + (query ? "?" + query : "");
+  const target = applyParams(new URL("http://127.0.0.1:" + port + "/"));
   if (!isLoopback(location.hostname)) {
     showRemote(port, target, say);
     return;
