@@ -1232,13 +1232,16 @@ describe("remote Magpie providers and non-native provider carrier", () => {
     const grokBody = JSON.parse(grokReply.body);
     assert.equal(grokBody.config.creditUsagePercent, 72.9);
     assert.equal(grokBody.config.currentPeriod.type, "USAGE_PERIOD_TYPE_CUSTOM");
+    assert.equal(grokBody.config.currentPeriod.start, undefined, "unknown window duration must not fabricate start=now");
 
     const devinReply = handleManagementApiCall(
       exposedGrok,
       { auth_index: xaiFiles[2].auth_index, url: "https://cli-chat-proxy.grok.com/v1/billing?format=credits" },
       NOW_MS,
     );
-    assert.equal(JSON.parse(devinReply.body).config.currentPeriod.type, "USAGE_PERIOD_TYPE_WEEKLY");
+    const devinBody = JSON.parse(devinReply.body);
+    assert.equal(devinBody.config.currentPeriod.type, "USAGE_PERIOD_TYPE_CUSTOM");
+    assert.ok(devinBody.config.currentPeriod.start, "known 7-day window keeps accurate start time");
 
     // Claude target: single synthetic "Magpie" account with weekly_scoped limits
     const exposedClaude = selectExposedAccounts(
