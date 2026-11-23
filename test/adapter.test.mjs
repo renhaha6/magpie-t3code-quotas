@@ -1212,13 +1212,17 @@ describe("remote Magpie providers and non-native provider carrier", () => {
     });
     // Default target is "grok": 1 native codex + 3 individual xai accounts
     assert.equal(exposedGrok.length, 4);
-    const grokAuth = buildAuthFilesResponse(exposedGrok);
+    const grokAuth = buildAuthFilesResponse(exposedGrok, { showAccountNames: true });
     const xaiFiles = grokAuth.files.filter((f) => f.provider === "xai");
     assert.equal(xaiFiles.length, 3);
     assert.deepEqual(
-      xaiFiles.map((f) => f.email),
+      xaiFiles.map((f) => f.id),
       ["WorkBuddy · 再睡五分钟吧", "WorkBuddy · 另一个中文号", "Devin · RAM"],
     );
+    assert.equal(xaiFiles.every((f) => f.email === undefined), true);
+    const codexFile = grokAuth.files.find((f) => f.provider === "codex");
+    assert.equal(codexFile.id, "codex@example.com");
+    assert.equal(codexFile.email, undefined);
     const grokReply = handleManagementApiCall(
       exposedGrok,
       { auth_index: xaiFiles[0].auth_index, url: "https://cli-chat-proxy.grok.com/v1/billing?format=credits" },

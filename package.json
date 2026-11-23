@@ -38,6 +38,7 @@
       "keptOnly": true,
       "autoWireT3Code": true,
       "otherProvidersT3Target": "grok",
+      "showAccountNamesInT3": true,
       "mode": "auto"
     },
     "page": {
