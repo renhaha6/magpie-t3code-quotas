@@ -37,6 +37,7 @@
       "port": 3478,
       "keptOnly": true,
       "autoWireT3Code": true,
+      "includeOtherProvidersInT3": true,
       "mode": "auto"
     },
     "page": {

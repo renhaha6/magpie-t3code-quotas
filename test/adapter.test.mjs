@@ -12,8 +12,11 @@ import {
   buildCodexUsagePayload,
   buildGrokUsagePayload,
   buildModelGroups,
+  buildOtherProvidersCarrier,
   classifyMagpieQuotas,
   handleManagementApiCall,
+  mapProvider,
+  OTHER_CARRIER_KEY,
   selectExposedAccounts,
 } from "../lib/adapter.mjs";
 import { createConfigStore, defaultConfig, normalizeConfig, resolveMagpieBaseUrl } from "../lib/config.mjs";
@@ -1086,5 +1089,155 @@ describe("cache source safety & mutation serialization", () => {
       await app.close();
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("remote Magpie providers and non-native provider carrier", () => {
+  test("maps remote-prefixed providers (<remote>/<provider>) to native T3 groups without colliding with local accounts", () => {
+    assert.deepEqual(mapProvider("ram/codex"), { canonical: "codex", t3Provider: "codex", remotePrefix: "ram" });
+    assert.deepEqual(mapProvider("edge/agy-cli"), { canonical: "antigravity", t3Provider: "antigravity", remotePrefix: "edge" });
+    assert.deepEqual(mapProvider("ram/claude"), { canonical: "claude", t3Provider: "claude", remotePrefix: "ram" });
+    assert.equal(mapProvider("ram/devin"), null);
+
+    const quotas = [
+      {
+        provider: "codex",
+        name: "Codex",
+        kind: "subscription",
+        plan: "team",
+        user: "same@example.com · Team",
+        windows: [
+          { name: "5 hours", used: 20, remaining: 80, resetsAt: "2026-11-21T04:00:00Z" },
+          { name: "7 days", used: 10, remaining: 90, resetsAt: "2026-11-27T00:00:00Z" },
+        ],
+      },
+      {
+        provider: "ram/codex",
+        name: "Codex · RAM",
+        kind: "subscription",
+        plan: "team",
+        user: "same@example.com · Team",
+        windows: [
+          { name: "5 hours", used: 35, remaining: 65, resetsAt: "2026-11-21T05:00:00Z" },
+          { name: "7 days", used: 15, remaining: 85, resetsAt: "2026-11-27T00:00:00Z" },
+        ],
+      },
+      {
+        provider: "ram/agy-cli",
+        name: "Antigravity · RAM",
+        kind: "subscription",
+        user: "g@gmail.com",
+        windows: [
+          { name: "Gemini · 5 hours", pool: "Gemini", used: 12, remaining: 88, resetsAt: "2026-11-21T04:00:00Z" },
+        ],
+      },
+    ];
+
+    const { t3Accounts, otherAccounts } = classifyMagpieQuotas(quotas, { lang: "zh-CN" });
+    assert.equal(t3Accounts.length, 3);
+    assert.equal(otherAccounts.length, 0);
+
+    const [localCodex, ramCodex, ramAgy] = t3Accounts;
+    assert.equal(localCodex.key, "codex:same@example.com · team:");
+    assert.equal(ramCodex.key, "codex:same@example.com · team:ram");
+    assert.equal(ramCodex.displayLabel, "same@example.com · Team（来自 RAM）");
+    assert.equal(ramAgy.t3Provider, "antigravity");
+    assert.equal(ramAgy.displayLabel, "g@gmail.com（来自 RAM）");
+
+    const auth = buildAuthFilesResponse(t3Accounts);
+    assert.equal(auth.files.length, 3);
+    assert.equal(auth.files[0].email, "same@example.com · Team");
+    assert.equal(auth.files[1].email, "same@example.com · Team（来自 RAM）");
+    assert.notEqual(auth.files[0].id_token.chatgpt_account_id, auth.files[1].id_token.chatgpt_account_id);
+    assert.equal(auth.files[2].provider, "antigravity");
+    assert.ok(auth.files[2].project_id);
+  });
+
+  test("carries non-native providers into synthetic Magpie Claude account when enabled and respects toggle", () => {
+    const quotas = [
+      SAMPLE_QUOTAS[3], // codex
+      {
+        provider: "workbuddy",
+        name: "WorkBuddy",
+        kind: "subscription",
+        user: "再睡五分钟吧",
+        windows: [
+          { name: "Credits", used: 72.9, remaining: 27.1, resetsAt: "2026-11-30T15:59:59Z" },
+          { name: "Total credits", used: 5.8, remaining: 94.2, resetsAt: "2026-11-30T15:59:59Z" },
+        ],
+      },
+      {
+        provider: "workbuddy",
+        name: "WorkBuddy",
+        kind: "subscription",
+        user: "另一个中文号",
+        windows: [{ name: "Credits", used: 10, remaining: 90, resetsAt: "2026-11-30T15:59:59Z" }],
+      },
+      {
+        provider: "ram/devin",
+        name: "Devin · RAM",
+        kind: "subscription",
+        user: "u@example.com",
+        windows: [{ name: "7 days", used: 22, remaining: 78, resetsAt: "2026-11-29T08:00:00Z" }],
+      },
+      {
+        provider: "zcode",
+        name: "ZCode",
+        kind: "subscription",
+        error: "no plan",
+        windows: [],
+      },
+      {
+        provider: "ram/~keys",
+        name: "RAM",
+        kind: "plan",
+        windows: [{ unlimited: true, name: "Limit", used: 0, remaining: 100 }],
+      },
+    ];
+
+    const { t3Accounts, otherAccounts } = classifyMagpieQuotas(quotas, { lang: "zh-CN" });
+    assert.equal(t3Accounts.length, 1);
+    assert.equal(otherAccounts.length, 5);
+
+    const carrier = buildOtherProvidersCarrier(otherAccounts, NOW_MS);
+    assert.ok(carrier);
+    assert.equal(carrier.key, OTHER_CARRIER_KEY);
+    assert.equal(carrier.carriedCount, 3, "should skip errored zcode and unlimited ram/~keys");
+
+    const exposedOn = selectExposedAccounts(t3Accounts, defaultConfig(), NOW_MS, {
+      lang: "zh-CN",
+      otherAccounts,
+    });
+    assert.equal(exposedOn.length, 2);
+    const auth = buildAuthFilesResponse(exposedOn);
+    const carrierAuth = auth.files.find((f) => f.auth_index === OTHER_CARRIER_KEY);
+    assert.deepEqual(carrierAuth, {
+      id: "Magpie",
+      auth_index: OTHER_CARRIER_KEY,
+      provider: "claude",
+      disabled: false,
+    });
+
+    const reply = handleManagementApiCall(
+      exposedOn,
+      { auth_index: OTHER_CARRIER_KEY, url: "https://api.anthropic.com/api/oauth/usage" },
+      NOW_MS,
+    );
+    assert.equal(reply.status_code, 200);
+    const body = JSON.parse(reply.body);
+    assert.equal(body.limits.length, 3);
+    assert.equal(body.limits[0].percent, 72.9);
+    // Two Chinese WorkBuddy names share the ASCII slug "workbuddy_", so second gets " #2"
+    assert.equal(body.limits[0].scope.model.display_name, "WorkBuddy · 再睡五分钟吧");
+    assert.equal(body.limits[1].scope.model.display_name, "WorkBuddy · 另一个中文号 #2");
+    assert.equal(body.limits[2].scope.model.display_name, "Devin · RAM");
+
+    const exposedOff = selectExposedAccounts(
+      t3Accounts,
+      { ...defaultConfig(), includeOtherProvidersInT3: false },
+      NOW_MS,
+      { lang: "zh-CN", otherAccounts },
+    );
+    assert.equal(exposedOff.length, 1);
   });
 });
