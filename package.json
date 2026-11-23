@@ -37,7 +37,7 @@
       "port": 3478,
       "keptOnly": true,
       "autoWireT3Code": true,
-      "includeOtherProvidersInT3": true,
+      "otherProvidersT3Target": "grok",
       "mode": "auto"
     },
     "page": {

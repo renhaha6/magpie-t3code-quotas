@@ -12,10 +12,12 @@ import {
   buildCodexUsagePayload,
   buildGrokUsagePayload,
   buildModelGroups,
+  buildOtherProviderExports,
   buildOtherProvidersCarrier,
   classifyMagpieQuotas,
   handleManagementApiCall,
   mapProvider,
+  OTHER_ANTIGRAVITY_CARRIER_KEY,
   OTHER_CARRIER_KEY,
   selectExposedAccounts,
 } from "../lib/adapter.mjs";
@@ -1204,12 +1206,45 @@ describe("remote Magpie providers and non-native provider carrier", () => {
     assert.equal(carrier.key, OTHER_CARRIER_KEY);
     assert.equal(carrier.carriedCount, 3, "should skip errored zcode and unlimited ram/~keys");
 
-    const exposedOn = selectExposedAccounts(t3Accounts, defaultConfig(), NOW_MS, {
+    const exposedGrok = selectExposedAccounts(t3Accounts, defaultConfig(), NOW_MS, {
       lang: "zh-CN",
       otherAccounts,
     });
-    assert.equal(exposedOn.length, 2);
-    const auth = buildAuthFilesResponse(exposedOn);
+    // Default target is "grok": 1 native codex + 3 individual xai accounts
+    assert.equal(exposedGrok.length, 4);
+    const grokAuth = buildAuthFilesResponse(exposedGrok);
+    const xaiFiles = grokAuth.files.filter((f) => f.provider === "xai");
+    assert.equal(xaiFiles.length, 3);
+    assert.deepEqual(
+      xaiFiles.map((f) => f.email),
+      ["WorkBuddy · 再睡五分钟吧", "WorkBuddy · 另一个中文号", "Devin · RAM"],
+    );
+    const grokReply = handleManagementApiCall(
+      exposedGrok,
+      { auth_index: xaiFiles[0].auth_index, url: "https://cli-chat-proxy.grok.com/v1/billing?format=credits" },
+      NOW_MS,
+    );
+    assert.equal(grokReply.status_code, 200);
+    const grokBody = JSON.parse(grokReply.body);
+    assert.equal(grokBody.config.creditUsagePercent, 72.9);
+    assert.equal(grokBody.config.currentPeriod.type, "USAGE_PERIOD_TYPE_CUSTOM");
+
+    const devinReply = handleManagementApiCall(
+      exposedGrok,
+      { auth_index: xaiFiles[2].auth_index, url: "https://cli-chat-proxy.grok.com/v1/billing?format=credits" },
+      NOW_MS,
+    );
+    assert.equal(JSON.parse(devinReply.body).config.currentPeriod.type, "USAGE_PERIOD_TYPE_WEEKLY");
+
+    // Claude target: single synthetic "Magpie" account with weekly_scoped limits
+    const exposedClaude = selectExposedAccounts(
+      t3Accounts,
+      { ...defaultConfig(), otherProvidersT3Target: "claude" },
+      NOW_MS,
+      { lang: "zh-CN", otherAccounts },
+    );
+    assert.equal(exposedClaude.length, 2);
+    const auth = buildAuthFilesResponse(exposedClaude);
     const carrierAuth = auth.files.find((f) => f.auth_index === OTHER_CARRIER_KEY);
     assert.deepEqual(carrierAuth, {
       id: "Magpie",
@@ -1219,7 +1254,7 @@ describe("remote Magpie providers and non-native provider carrier", () => {
     });
 
     const reply = handleManagementApiCall(
-      exposedOn,
+      exposedClaude,
       { auth_index: OTHER_CARRIER_KEY, url: "https://api.anthropic.com/api/oauth/usage" },
       NOW_MS,
     );
@@ -1232,9 +1267,44 @@ describe("remote Magpie providers and non-native provider carrier", () => {
     assert.equal(body.limits[1].scope.model.display_name, "WorkBuddy · 另一个中文号 #2");
     assert.equal(body.limits[2].scope.model.display_name, "Devin · RAM");
 
+    // Antigravity target: single synthetic "Magpie" account with custom groups buckets
+    const exposedAgy = selectExposedAccounts(
+      t3Accounts,
+      { ...defaultConfig(), otherProvidersT3Target: "antigravity" },
+      NOW_MS,
+      { lang: "zh-CN", otherAccounts },
+    );
+    assert.equal(exposedAgy.length, 2);
+    const agyAuth = buildAuthFilesResponse(exposedAgy);
+    const agyCarrier = agyAuth.files.find((f) => f.auth_index === OTHER_ANTIGRAVITY_CARRIER_KEY);
+    assert.deepEqual(agyCarrier, {
+      id: "Magpie",
+      auth_index: OTHER_ANTIGRAVITY_CARRIER_KEY,
+      provider: "antigravity",
+      disabled: false,
+      project_id: "magpie-other-providers",
+    });
+    const agyReply = handleManagementApiCall(
+      exposedAgy,
+      {
+        auth_index: OTHER_ANTIGRAVITY_CARRIER_KEY,
+        url: "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
+      },
+      NOW_MS,
+    );
+    assert.equal(agyReply.status_code, 200);
+    const agyBody = JSON.parse(agyReply.body);
+    assert.equal(agyBody.groups.length, 3);
+    assert.equal(agyBody.groups[0].displayName, "WorkBuddy · 再睡五分钟吧");
+    assert.equal(agyBody.groups[0].buckets[0].displayName, "Credits");
+    assert.equal(agyBody.groups[2].displayName, "Devin · RAM");
+    assert.equal(agyBody.groups[2].buckets[0].window, "weekly");
+
+    // Off target (and legacy includeOtherProvidersInT3: false)
+    assert.equal(buildOtherProviderExports(otherAccounts, "off", NOW_MS).length, 0);
     const exposedOff = selectExposedAccounts(
       t3Accounts,
-      { ...defaultConfig(), includeOtherProvidersInT3: false },
+      { ...defaultConfig(), otherProvidersT3Target: "off" },
       NOW_MS,
       { lang: "zh-CN", otherAccounts },
     );
