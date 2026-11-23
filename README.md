@@ -1,6 +1,9 @@
 # magpie-t3code-quotas
 
-极简的 **Magpie 插件**，让你在 **T3 Code 的 `Usage → Limits`** 里直接查看 Magpie 各账号的剩余额度与多账号汇总。
+> **Fork 说明与致谢**
+> 本仓库基于 [`uiuing/magpie-t3code-quotas`](https://github.com/uiuing/magpie-t3code-quotas)（MIT License）进行二次开发与增强；其中“将 T3 Code 非原生白名单厂商透传到 T3 Code 用量面板”的思路参考了 [`8liang/magpie-t3code-hub`](https://github.com/8liang/magpie-t3code-hub)（MIT License）。完整保留原作者版权声明与 MIT 许可证，感谢两位作者的开源贡献！
+
+极简的 **Magpie 插件**，让你在 **T3 Code 的 `Usage → Limits`** 里直接查看 Magpie 各账号（含远程 Magpie 与非原生厂商）的剩余额度与多账号汇总。
 
 - **零改源码**：不改 Magpie 本体，也不改 T3 Code 本体，纯薄适配层。
 - **零第三方依赖**：纯 ES Modules + Node/Bun 内置 API。
@@ -9,14 +12,31 @@
 
 ---
 
+## 本 Fork 新增与改进
+
+1. **修复远程 Magpie 供应商（`<remote>/<provider>`）无法显示的问题**
+   - 自动解析带远程前缀的供应商（如 `ram/codex`、`ram/claude`、`ram/agy-cli`、`ram/grok`），剥离前缀后归入对应的 T3 Code 原生分组，同时保留来源标识（如 `来自 RAM`），与本地同名账号清晰区分、不撞 Key。
+2. **支持将其他非原生厂商透传到 T3 Code，并可自由选择显示分组**
+   - 可将 **WorkBuddy、Qoder CN、MClaw、Devin** 等 T3 Code 原生白名单之外的厂商额度一并展示到 T3 Code（自动跳过报错与无限额条目），并在 Magpie 左侧栏控制页的「其他厂商」卡片右上角 /「高级设置」中实时切换承载方式：
+     - **借用 Grok 分组（默认推荐）**：独立区域展示，统一进度条铺满整行、无虚假 `Weekly ·` 前缀，不污染 Claude / Codex / Antigravity 分组（适合未使用 Grok 的用户）。
+     - **借用 Claude 分组**：合并为单列 `Magpie` 汇总展示。
+     - **借用 Antigravity 分组**：以自定义 `groups` 桶展示真实的 `<供应商/账号> · <窗口名>`，每项独占一条完整进度条。
+     - **不透传**：仅在 Magpie 插件控制页查看，保持 T3 面板绝对纯净。
+3. **支持在 T3 Code 中直接明文显示完整账号名（默认开启）**
+   - 新增「高级设置 → 在 T3 中明文显示账号名」开关，解决 T3 Code 默认将账号名折叠为 1～2 个首字母缩写（如 `D / M / Q / W`）的问题，移动端与桌面端均可直接看清完整账号与厂商名称。
+4. **优化进度条与节奏标尺准确性**
+   - 修复多厂商不同周期混排时进度条分裂出空白列的问题，以及未知周期时长误报 `Ahead of pace` 标尺的问题。
+
+---
+
 ## 安装方式
 
 ### 在 Magpie 中安装（推荐）
 
-打开 Magpie → **Plugins（插件）** 添加，或执行：
+打开 Magpie → **Plugins（插件）** 添加 `github:renhaha6/magpie-t3code-quotas`，或执行：
 
 ```sh
-magpie plugin add github:uiuing/magpie-t3code-quotas
+magpie plugin add github:renhaha6/magpie-t3code-quotas
 ```
 
 安装开启后：
@@ -57,8 +77,8 @@ node serve.mjs
 
 ## 支持范围与说明
 
-- **T3 Code 原生 `Usage → Limits` 范围**：受 T3 Code 服务端白名单限制，原生显示 **Claude、Codex (ChatGPT)、Antigravity、Grok** 四类订阅账号（支持多账号、多套餐与 Remote Magpie 账号）。
-- **其他厂商额度**：WorkBuddy、DeepSeek、Kimi、GLM、MiniMax 及 API Key 余额会在控制页的「按模型看」与底部「其他厂商额度」中汇总展示。
+- **T3 Code 原生 `Usage → Limits` 范围**：受 T3 Code 服务端白名单限制，原生分组显示 **Claude、Codex (ChatGPT)、Antigravity、Grok** 四类订阅账号（支持多账号、多套餐与 `<remote>/<provider>` 远程 Magpie 账号）。
+- **其他非原生厂商额度**：WorkBuddy、Qoder CN、MClaw、Devin、DeepSeek、Kimi、GLM、MiniMax 等既会在控制页的「按模型看」与底部「其他厂商」中汇总展示，也可通过控制页下拉框透传到 T3 Code（支持 **Grok / Claude / Antigravity / 不透传** 四种模式）。
 - **远程 T3 Code 接入**：服务仅监听 `127.0.0.1`；若 T3 Code 在另一台电脑，请在控制页展开「连接密钥与远程设备手动接入」复制 SSH 隧道命令后手动添加到 T3 Code。
 
 ## 本地测试
@@ -69,6 +89,9 @@ bun test
 node --test
 ```
 
-## License
+## 致谢与许可（License）
 
-MIT
+- 原项目：[uiuing/magpie-t3code-quotas](https://github.com/uiuing/magpie-t3code-quotas)（`Copyright (c) 2026 uiuing`，MIT License）
+- 非原生厂商透传思路参考：[8liang/magpie-t3code-hub](https://github.com/8liang/magpie-t3code-hub)（MIT License）
+
+本项目继续沿用 **MIT License**，详见 [LICENSE](./LICENSE)。
